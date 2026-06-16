@@ -89,3 +89,8 @@ verify, commit, and let stations pull it.
 - **`environment.yml` vs `config.yaml`** — the `.yml` file is the Python
   environment spec; the `.yaml` file is the runtime camera/calibration
   config. They are unrelated.
+- **"...is not digitally signed / cannot be loaded" on Windows** — that's a
+  PowerShell execution-policy block, common on domain/managed machines. Setup
+  is pure `.bat` (cmd) specifically to avoid it, so this shouldn't appear. If
+  you see it, you're running an old `setup_windows.ps1` — delete it and use
+  `setup_windows.bat`. The launchers are also pure `.bat` and are unaffected.
