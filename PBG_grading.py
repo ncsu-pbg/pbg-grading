@@ -911,6 +911,28 @@ app.layout = dbc.Container([
                 dbc.Row(id="viz-stats", className="g-2 mt-1"),
             ]),
 
+            _card("Download Recording", [
+                dbc.Row([
+                    dbc.Col([
+                        html.Div("File name", style=LABEL_STYLE),
+                        dbc.Input(id="local-filename", size="sm",
+                                  placeholder="e.g. Sample 1"),
+                    ], md=7),
+                    dbc.Col(
+                        dbc.Button([html.I(className="bi bi-download me-1"),
+                                    "Download to This Computer"],
+                                   id="btn-local-download",
+                                   style=BTN_PRIMARY, className="w-100",
+                                   size="sm"),
+                        md=5, className="d-flex align-items-end"),
+                ], className="g-2 mb-1 align-items-end"),
+                html.Div("Saves the most recent run's CSV to your computer — "
+                         "no Dropbox account needed.",
+                         className="text-muted", style={"fontSize": "11px"}),
+                dcc.Download(id="local-download"),
+                html.Div(id="local-result", className="mt-2"),
+            ]),
+
             _card("Export to Dropbox", [
                 dbc.Row([
                     dbc.Col([
@@ -923,7 +945,7 @@ app.layout = dbc.Container([
                         ]),
                     ], md=7),
                     dbc.Col([
-                        html.Div("File name", style=LABEL_STYLE),
+                        html.Div("File Name", style=LABEL_STYLE),
                         dbc.Input(id="dropbox-filename", size="sm",
                                   placeholder="e.g. Sample 1"),
                     ], md=5),
@@ -1318,6 +1340,29 @@ def dropbox_download(_n, folder, filename):
     except Exception as e:  # noqa: BLE001
         return dbc.Alert(f"Upload failed: {e}", color="danger",
                          dismissable=True, className="small mb-0")
+
+
+# ── Local: download the latest recording CSV to the operator's computer ──────
+# No Dropbox / no .env needed — streams the file straight to the browser, so
+# anyone running a station can keep their data.
+@app.callback(
+    Output("local-download", "data"),
+    Output("local-result", "children"),
+    Input("btn-local-download", "n_clicks"),
+    State("local-filename", "value"),
+    prevent_initial_call=True,
+)
+def local_download(_n, filename):
+    last = CONTROLLER.snapshot()["last_csv"]
+    if not last or not Path(last).exists():
+        return dash.no_update, dbc.Alert("No recording available to download yet.",
+                                         color="warning", className="small mb-0")
+    name = (filename or "").strip() or Path(last).name
+    if not name.lower().endswith(".csv"):
+        name += ".csv"
+    return (dcc.send_file(last, filename=name),
+            dbc.Alert(f"Downloading {name}", color="success",
+                      dismissable=True, className="small mb-0"))
 
 
 if __name__ == "__main__":
