@@ -915,7 +915,7 @@ app.layout = dbc.Container([
             _card("Download Recording", [
                 dbc.Row([
                     dbc.Col([
-                        html.Div("File name", style=LABEL_STYLE),
+                        html.Div("File Name", style=LABEL_STYLE),
                         dbc.Input(id="local-filename", size="sm",
                                   placeholder="e.g. Sample 1"),
                     ], md=7),
