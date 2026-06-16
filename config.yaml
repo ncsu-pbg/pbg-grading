@@ -1,0 +1,108 @@
+mode: pod
+output_dir: ./output
+report_interval_s: 2.0
+modes:
+  pod:
+    label: Pod
+    device_ip: 10.80.32.101
+    model_path: ./models/synthdata_pods_v1.rvc4.tar.xz
+    surface_angle_deg: -144.3
+    imu_bias:
+      pitch_deg: 0.0
+      roll_deg: 0.0
+    camera:
+      fps: 30
+      width: 1280
+      height: 800
+      manual_focus: 164
+      exposure_us: 700
+      iso: 1000
+      rotate_180: false
+    nn:
+      input_size:
+      - 1280
+      - 768
+      confidence_threshold: 0.7
+    capture_crop:
+      x_min: 0.20375
+      x_max: 0.7625
+      y_min: 0.222
+      y_max: 0.748
+    calibration:
+      mm_per_px: 0.234769
+      px_per_mm: 4.2595
+      color_matrix:
+      - - 0.22474600563038657
+        - 0.447837311282854
+        - 0.03318822936495153
+      - - 0.07672222821423952
+        - 0.6764943312407303
+        - -0.00586310607368673
+      - - -0.08442073685782882
+        - 0.2653799421052998
+        - 0.5921383928415056
+      color_bias:
+      - -0.05170688791603356
+      - -0.05180841939785874
+      - -0.07289613998610994
+    tracker:
+      iou_threshold: 0.5
+      distance_threshold: 300.0
+      matching: hungarian
+      max_age: 2
+    min_mask_area_px: 200
+    entry_zone_threshold_rel: 0.15
+    border_pad_px: 2
+    overlap_iou_threshold: 0.12
+  seed:
+    label: Seed
+    device_ip: 10.80.32.100
+    model_path: ./models/synthdata_seeds_v1.rvc4.tar.xz
+    surface_angle_deg: 154.5
+    imu_bias:
+      pitch_deg: 0.0
+      roll_deg: 0.0
+    camera:
+      fps: 30
+      width: 1280
+      height: 800
+      manual_focus: 180
+      exposure_us: 700
+      iso: 1000
+      rotate_180: true
+    nn:
+      input_size:
+      - 1280
+      - 768
+      confidence_threshold: 0.7
+    capture_crop:
+      x_min: 0.0
+      x_max: 1.0
+      y_min: 0.0
+      y_max: 1.0
+    calibration:
+      mm_per_px: 0.156594
+      px_per_mm: 6.3859
+      color_matrix:
+      - - 0.21743303685921583
+        - 0.5023222878408184
+        - 0.013013961527868823
+      - - 0.07728292522220107
+        - 0.7496561118494679
+        - -0.05694244639737933
+      - - -0.08174950256749056
+        - 0.2273763868643382
+        - 0.6933945514564421
+      color_bias:
+      - -0.06709219247629128
+      - -0.06680380969125377
+      - -0.07766408024055793
+    tracker:
+      iou_threshold: 0.5
+      distance_threshold: 500.0
+      matching: hungarian
+      max_age: 2
+    min_mask_area_px: 30
+    entry_zone_threshold_rel: 0.0
+    border_pad_px: 2
+    overlap_iou_threshold: 0.12

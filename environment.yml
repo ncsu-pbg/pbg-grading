@@ -1,0 +1,39 @@
+# PBG Grading — per-station conda environment spec.
+#
+# NOT the same file as config.yaml (runtime camera/calibration config).
+# This file defines the Python environment only.
+#
+# Versions are pinned from the known-good development environment
+# (conda env "grading", exported 2026-06-12). The camera/firmware/driver
+# stack is the fragile layer — do not float these to latest. To change a
+# pin, verify on a dev machine with cameras attached first, commit, then
+# `git pull` + re-run the setup script on each station.
+#
+# Install rule this encodes: everything from conda-forge, EXCEPT depthai,
+# which is pip-only (Luxonis does not publish it on conda-forge).
+name: grading
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11.15
+  # Web UI
+  - dash=4.2.0
+  - dash-bootstrap-components=2.0.4
+  - plotly=6.6.0
+  # Numerics
+  - numpy=2.4.6
+  - pandas=3.0.3
+  - scipy=1.17.1
+  # Imaging / GUI (calibrate.py dialogs)
+  - opencv=4.13.0=headless_*
+  - pyqt6=6.8.1
+  # Config / export
+  - pyyaml=6.0.3
+  - python-dotenv=1.2.2
+  - requests=2.34.2
+  - dropbox=12.0.2
+  # pip-only layer
+  - pip
+  - pip:
+      - depthai==3.6.1

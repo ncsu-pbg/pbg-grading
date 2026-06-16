@@ -1,0 +1,14 @@
+# Per-station local environment (rebuilt anytime by the setup script)
+.micromamba/
+envs/
+
+# Per-station secrets (Dropbox tokens) — copy .env to each station by hand
+.env
+
+# Runtime output (recordings, CSVs)
+output/
+
+# Python / OS noise
+__pycache__/
+*.pyc
+.DS_Store
