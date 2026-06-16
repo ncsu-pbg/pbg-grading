@@ -25,7 +25,11 @@
       "Bash(sed -n '1,80p' gui/setup_dialog.py)",
       "Bash(./envs/grading/bin/python -c \"import ast; ast.parse\\(open\\('calibrate.py'\\).read\\(\\)\\); print\\('calibrate.py parses OK'\\)\")",
       "Bash(./envs/grading/bin/python -c \"import argparse, sys; from PyQt6.QtCore import Qt, QTimer; from PyQt6.QtWidgets import QApplication; print\\('calibrate.py imports resolve OK'\\)\")",
-      "Bash(awk '{print $5, $9}')"
+      "Bash(awk '{print $5, $9}')",
+      "Bash(curl -sL --retry 2 -o mm_url_check.exe \"https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-win-64\")",
+      "Bash(rm -f mm_url_check.exe)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
