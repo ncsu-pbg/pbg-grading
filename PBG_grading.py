@@ -917,20 +917,16 @@ app.layout = dbc.Container([
                     dbc.Col([
                         html.Div("File Name", style=LABEL_STYLE),
                         dbc.Input(id="local-filename", size="sm",
-                                  placeholder="e.g. Sample 1"),
+                                  placeholder="e.g. Sample 1 - Default:[Sample Name]"),
                     ], md=7),
                     dbc.Col(
                         dbc.Button([html.I(className="bi bi-download me-1"),
-                                    "Download to This Computer"],
+                                    "Download to Computer"],
                                    id="btn-local-download",
                                    style=BTN_PRIMARY, className="w-100",
                                    size="sm"),
                         md=5, className="d-flex align-items-end"),
                 ], className="g-2 mb-1 align-items-end"),
-                html.Div("Saves the most recent run's CSV to your computer — "
-                         "no Dropbox account needed. Leave the name blank to "
-                         "use the sample name.",
-                         className="text-muted", style={"fontSize": "11px"}),
                 dcc.Download(id="local-download"),
                 html.Div(id="local-result", className="mt-2"),
             ]),
@@ -949,7 +945,7 @@ app.layout = dbc.Container([
                     dbc.Col([
                         html.Div("File Name", style=LABEL_STYLE),
                         dbc.Input(id="dropbox-filename", size="sm",
-                                  placeholder="e.g. Sample 1"),
+                                  placeholder="e.g. Sample 1 - Default:[Sample Name]"),
                     ], md=5),
                 ], className="g-2 mb-2 align-items-end"),
                 dbc.Row([
