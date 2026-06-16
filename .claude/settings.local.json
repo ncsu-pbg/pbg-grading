@@ -33,7 +33,11 @@
       "Bash(./envs/grading/bin/python -c \"import ast; ast.parse\\(open\\('PBG_grading.py'\\).read\\(\\)\\); print\\('PBG_grading.py parses OK'\\)\")",
       "Bash(./envs/grading/bin/python -c \"import dash; from dash import dcc; print\\('dash.no_update:', hasattr\\(dash, 'no_update'\\)\\); print\\('dcc.send_file:', hasattr\\(dcc, 'send_file'\\)\\)\")",
       "Bash(curl -s --compressed http://127.0.0.1:8050/_dash-layout -o /tmp/layout.json -w \"bytes: %{size_download}\\\\n\")",
-      "Bash(rm -f /tmp/_pbg_sample.csv /tmp/layout.json /tmp/dl_srv*.log; echo \"cleaned\")"
+      "Bash(rm -f /tmp/_pbg_sample.csv /tmp/layout.json /tmp/dl_srv*.log; echo \"cleaned\")",
+      "Bash(sed -n '410,440p' PBG_grading.py)",
+      "Bash(sed -n '480,496p' PBG_grading.py)",
+      "Bash(./envs/grading/bin/python -c \"import ast; ast.parse\\(open\\('PBG_grading.py'\\).read\\(\\)\\); print\\('parses OK'\\)\")",
+      "Bash(./envs/grading/bin/python -)"
     ]
   }
 }

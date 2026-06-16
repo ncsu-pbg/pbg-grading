@@ -489,6 +489,7 @@ class GradingController:
                 "log": "\n".join(self.logs),
                 "session": list(self.session),
                 "last_csv": str(self.last_csv_path) if self.last_csv_path else "",
+                "last_sample": self._run_plot_name,
                 "error": self.last_error,
             }
 
@@ -927,7 +928,8 @@ app.layout = dbc.Container([
                         md=5, className="d-flex align-items-end"),
                 ], className="g-2 mb-1 align-items-end"),
                 html.Div("Saves the most recent run's CSV to your computer — "
-                         "no Dropbox account needed.",
+                         "no Dropbox account needed. Leave the name blank to "
+                         "use the sample name.",
                          className="text-muted", style={"fontSize": "11px"}),
                 dcc.Download(id="local-download"),
                 html.Div(id="local-result", className="mt-2"),
@@ -1353,11 +1355,15 @@ def dropbox_download(_n, folder, filename):
     prevent_initial_call=True,
 )
 def local_download(_n, filename):
-    last = CONTROLLER.snapshot()["last_csv"]
+    snap = CONTROLLER.snapshot()
+    last = snap["last_csv"]
     if not last or not Path(last).exists():
         return dash.no_update, dbc.Alert("No recording available to download yet.",
                                          color="warning", className="small mb-0")
-    name = (filename or "").strip() or Path(last).name
+    # Blank file name -> use the run's sample name; fall back to the CSV's name.
+    name = ((filename or "").strip()
+            or (snap.get("last_sample") or "").strip()
+            or Path(last).name)
     if not name.lower().endswith(".csv"):
         name += ".csv"
     return (dcc.send_file(last, filename=name),
