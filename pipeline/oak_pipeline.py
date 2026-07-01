@@ -103,6 +103,7 @@ class OakPipelineThread(QThread):
             distance_threshold=tracker_cfg.get("distance_threshold", 300.0),
             matching=str(tracker_cfg.get("matching", "greedy")),
             max_age=int(tracker_cfg.get("max_age", 0)),
+            min_hits=int(tracker_cfg.get("min_hits", 1)),
         )
 
         # Reference to the host node (set during run)
