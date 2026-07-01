@@ -12,3 +12,6 @@ output/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Per-user Claude Code settings (local; may hold secrets)
+.claude/

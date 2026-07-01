@@ -38,6 +38,25 @@ aggregate -- used to suppress measurements taken when the mask was
 edge-clipped or occluded by another pod.  Defaults to True so existing
 callers are unaffected.  Note: ``width_valid`` affects *only* the width
 aggregate; it never influences matching or track creation.
+
+Measurement source (``mask_meas``)
+----------------------------------
+Detections may carry an optional ``mask_meas`` flag (default True):
+True when length/width/area came from the segmentation mask, False when
+the host fell back to the axis-aligned bbox.  Mask-derived length/area
+always outrank bbox fallbacks in the max-area aggregate -- a bbox area
+is systematically larger than the mask area, so letting it compete
+would let a single failed-mask frame permanently capture the max-area
+slot (and with it the recorded length).
+
+Track confirmation (``min_hits``)
+---------------------------------
+With ``min_hits=1`` (default) every track is counted/exported from its
+first matched frame -- the legacy behaviour, where a single-frame false
+positive becomes a permanent count.  With ``min_hits=N`` a track must
+accumulate N matched-detection frames before it appears in ``max_dims``
+/ ``total_unique``.  Measurements accumulate from the first frame
+either way, so nothing is lost once a track is confirmed.
 """
 
 import math
@@ -102,6 +121,14 @@ class TrackMeasurement:
     # carries a number, and ``width_quality`` lets downstream filtering
     # spot those rows.
     width_quality: str = "clean"          # 'clean' | 'fallback'
+    # Length/area provenance: 'mask' when the current max-area frame's
+    # measurements came from the segmentation mask, 'bbox' when every
+    # frame so far fell back to the (systematically larger) bbox.
+    meas_quality: str = "mask"            # 'mask' | 'bbox'
+    # Matched-detection frames for this track.  Tracks with
+    # hits < RealtimeTracker.min_hits are excluded from max_dims /
+    # total_unique (unconfirmed -- likely single-frame false positives).
+    hits: int = 0
     _width_invalid_min: float = field(default=float("inf"), repr=False)
     _width_valid_count: int = field(default=0, repr=False)
 
@@ -126,6 +153,7 @@ class RealtimeTracker:
         distance_threshold: float = 300.0,
         matching: str = "greedy",
         max_age: int = 0,
+        min_hits: int = 1,
     ):
         self.iou_threshold = float(iou_threshold)
         self.distance_threshold = float(distance_threshold)
@@ -135,6 +163,7 @@ class RealtimeTracker:
             )
         self.matching = matching
         self.max_age = max(0, int(max_age))
+        self.min_hits = max(1, int(min_hits))
 
         self._frame_count: int = 0
         self._next_track_id: int = 0
@@ -142,7 +171,9 @@ class RealtimeTracker:
         self._track_dy: Dict[int, float] = {}     # EMA of per-frame dy
         self._track_age: Dict[int, int] = {}      # frames since last match
         self._prev_centers: List[Tuple[int, int]] = []
-        self.max_dims: Dict[int, TrackMeasurement] = {}
+        # ALL tracks ever measured, confirmed or not.  External readers
+        # use the max_dims property, which filters by min_hits.
+        self._all_dims: Dict[int, TrackMeasurement] = {}
 
         # Lazy scipy probe so 'greedy' callers don't pay any cost.
         self._scipy_assign = None
@@ -162,8 +193,24 @@ class RealtimeTracker:
 
     @property
     def total_unique(self) -> int:
-        """Number of unique pods tracked so far."""
-        return len(self.max_dims)
+        """Number of unique confirmed pods (hits >= min_hits) so far."""
+        if self.min_hits <= 1:
+            return len(self._all_dims)
+        # list() snapshots under the GIL so the GUI thread can read this
+        # while the host node thread is inserting new tracks.
+        return sum(
+            1 for m in list(self._all_dims.values()) if m.hits >= self.min_hits
+        )
+
+    @property
+    def max_dims(self) -> Dict[int, TrackMeasurement]:
+        """Per-track aggregate stats for confirmed tracks only."""
+        if self.min_hits <= 1:
+            return self._all_dims
+        return {
+            tid: m for tid, m in list(self._all_dims.items())
+            if m.hits >= self.min_hits
+        }
 
     @property
     def active_count(self) -> int:
@@ -178,7 +225,7 @@ class RealtimeTracker:
         self._track_dy.clear()
         self._track_age.clear()
         self._prev_centers.clear()
-        self.max_dims.clear()
+        self._all_dims.clear()
 
     # ── Track lifecycle helpers ──────────────────────────────────────
     def _update_dy(self, tid: int, prev_pt: Tuple[int, int],
@@ -330,6 +377,7 @@ class RealtimeTracker:
                 "width":       d["width"],
                 "area":        d["area"],
                 "width_valid": d.get("width_valid", True),
+                "mask_meas":   d.get("mask_meas", True),
                 "mean_bgr":    d.get("mean_bgr"),
             }
 
@@ -338,11 +386,15 @@ class RealtimeTracker:
         # ── Association ──────────────────────────────────────────────
         if self._frame_count <= 2:
             # Bootstrap: seed tracks from any pair of close-by centers
-            # across the first two frames (unchanged legacy behaviour).
+            # across the first two frames.  Each detection spawns at most
+            # ONE track -- without the break, a detection near several
+            # previous-frame centers spawned one track per neighbour, and
+            # every duplicate was measured and counted.
             for pt in cur_centers:
                 for pt2 in self._prev_centers:
                     if math.hypot(pt2[0] - pt[0], pt2[1] - pt[1]) < 200:
                         self._spawn_track(pt, 0.0)
+                        break
         elif self.matching == "hungarian":
             assignments, lost, unmatched = self._match_hungarian(cur_centers)
             if assignments is None:    # scipy unavailable; fall back
@@ -373,12 +425,21 @@ class RealtimeTracker:
             area        = dims["area"]
             mean_bgr    = dims.get("mean_bgr")
             width_valid = bool(dims.get("width_valid", True))
+            meas_src    = "mask" if dims.get("mask_meas", True) else "bbox"
 
-            if tid in self.max_dims:
-                m = self.max_dims[tid]
-                if area > m.area:
-                    m.area   = area
-                    m.length = length
+            if tid in self._all_dims:
+                m = self._all_dims[tid]
+                m.hits += 1
+                # Mask-derived length/area always outrank bbox fallbacks;
+                # within the same source, larger area wins.
+                if meas_src == m.meas_quality:
+                    better = area > m.area
+                else:
+                    better = meas_src == "mask"
+                if better:
+                    m.area         = area
+                    m.length       = length
+                    m.meas_quality = meas_src
                     if mean_bgr is not None:
                         m.mean_bgr = mean_bgr
                 if width_valid:
@@ -405,13 +466,15 @@ class RealtimeTracker:
                         mean_bgr=mean_bgr, width_quality="fallback",
                     )
                     m._width_invalid_min = width
-                self.max_dims[tid] = m
+                m.hits = 1
+                m.meas_quality = meas_src
+                self._all_dims[tid] = m
 
         # Resolve fallback widths for tracks that *never* saw a valid
         # frame -- use the min over invalid frames so the CSV still
         # carries a number.  Tracks with at least one valid frame keep
         # their clean min.
-        for m in self.max_dims.values():
+        for m in self._all_dims.values():
             if m._width_valid_count == 0 and m._width_invalid_min != float("inf"):
                 m.width = m._width_invalid_min
                 m.width_quality = "fallback"

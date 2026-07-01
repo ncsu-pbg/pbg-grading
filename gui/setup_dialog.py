@@ -500,6 +500,25 @@ class SetupDialog(QDialog):
         self.cfg["calibration"]["mm_per_px"] = round(mm_per_px, 6)
         self.cfg["calibration"]["px_per_mm"] = round(px_per_mm, 4)
 
+        # ── Lens intrinsics (device factory K + distortion) ───────────────
+        # Persisted so the measurement host node can undistort dimensions
+        # (undistort_measurements). Only saved when REAL (non-approx)
+        # intrinsics were read from the device.
+        K_int        = getattr(self._worker, "camera_K", None)
+        dist_int     = getattr(self._worker, "camera_dist", None)
+        intr_approx  = getattr(self._worker, "intrinsics_approx", True)
+        if K_int is not None and dist_int is not None and not intr_approx:
+            dflat = []
+            for el in dist_int.tolist():
+                dflat.extend(el) if isinstance(el, (list, tuple)) else dflat.append(el)
+            self.cfg["calibration"]["camera_matrix"] = [
+                [float(v) for v in row] for row in K_int.tolist()
+            ]
+            self.cfg["calibration"]["dist_coeffs"] = [float(v) for v in dflat]
+            intr_note = "\n  lens intrinsics saved (K + dist)"
+        else:
+            intr_note = "\n  lens intrinsics: NOT SAVED (approx intrinsics)"
+
         # ── Colour correction matrix ──────────────────────────────────────
         color_matrix = self._worker.color_matrix
         color_bias   = self._worker.color_bias
@@ -569,6 +588,7 @@ class SetupDialog(QDialog):
             f"  px/mm  = {px_per_mm:.4f}\n"
             f"  mm/px  = {mm_per_px:.6f}"
             + color_note
+            + intr_note
             + roi_note
             + file_note,
         )

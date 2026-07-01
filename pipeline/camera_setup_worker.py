@@ -591,6 +591,11 @@ class CameraSetupWorker(QThread):
         self.color_matrix: Optional[np.ndarray] = None
         self.color_bias:   Optional[np.ndarray] = None
         self._color_rms:   Optional[float] = None
+        # Device factory lens intrinsics (set in run(); read by
+        # SetupDialog._on_save to persist for measurement-path undistortion).
+        self.camera_K:    Optional[np.ndarray] = None
+        self.camera_dist: Optional[np.ndarray] = None
+        self.intrinsics_approx: bool = True
 
     def request_stop(self):
         self._stop_requested = True
@@ -613,6 +618,9 @@ class CameraSetupWorker(QThread):
             return
 
         K, dist, approx = _load_intrinsics_from_device(device_info, cam_cfg, cap_w, cap_h)
+        self.camera_K = K
+        self.camera_dist = dist
+        self.intrinsics_approx = approx
         if approx:
             self.log_message.emit(
                 "WARNING: Could not read device calibration — using approximate "
