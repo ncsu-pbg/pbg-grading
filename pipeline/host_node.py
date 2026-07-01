@@ -7,6 +7,8 @@ filters by ROI / entry zone / confidence, extracts mask measurements,
 and feeds the RealtimeTracker.
 """
 
+import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import depthai as dai
@@ -89,6 +91,15 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
         self._mask_px_to_crop_px_len = 1.0
         self._mask_geom_locked = False
 
+        # Optional measurement-path lens undistortion (off unless
+        # undistort_measurements is set AND camera_matrix/dist_coeffs exist in
+        # the calibration block). Scales measured dimensions by the local
+        # undistortion magnification at each detection's centroid; positions
+        # (cx,cy) are left unchanged so tracking/counting are unaffected.
+        self._undistort = False
+        self._K_crop = None      # 3x3 K with principal point shifted to crop origin
+        self._dist = None        # distortion coeffs (k1,k2,p1,p2[,k3,...])
+
         # Pipeline config values (set from cfg in _init_geometry)
         self._conf_threshold = 0.70
         self._entry_zone_rel = 0.15
@@ -98,6 +109,14 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
         # mask) or overlaps another detection (occluded pod underneath).
         self._border_pad_px = 2
         self._overlap_iou_threshold = 0.12
+
+        # Optional per-frame calibration log (off unless cfg.calibration_log).
+        # Records per-detection crop-pixel measurements so size correction
+        # (parallax + mask-fat) can be fit against calipered ground truth.
+        self._calib_enabled = False
+        self._calib_log = None
+        self._plot_name = "run"
+        self._output_dir = "./output"
 
     def _init_geometry(self):
         """Pre-compute all coordinate mapping from config."""
@@ -119,6 +138,10 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
         self._border_pad_px = cfg.get("border_pad_px", 2)
         self._overlap_iou_threshold = cfg.get("overlap_iou_threshold", 0.12)
 
+        self._calib_enabled = bool(cfg.get("calibration_log", False))
+        self._plot_name = str(cfg.get("plot_name", "run"))
+        self._output_dir = str(cfg.get("output_dir", "./output"))
+
         # Capture crop size in camera pixels
         cx_min = cap.get("x_min", 0.0)
         cx_max = cap.get("x_max", 1.0)
@@ -136,8 +159,92 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
         self._mask_px_to_crop_px_area = (1.0 / self._lb["scale"]) ** 2
         self._mask_px_to_crop_px_len = 1.0 / self._lb["scale"]
 
+        # Measurement-path lens undistortion (optional, per-mode). camera_matrix
+        # and dist_coeffs are written to the calibration block by the setup
+        # dialog (device factory calibration). We shift K's principal point to
+        # the crop origin so crop-pixel measurements can be undistorted directly.
+        self._undistort = bool(cfg.get("undistort_measurements", False))
+        self._K_crop = None
+        self._dist = None
+        cal = cfg.get("calibration", {}) or {}
+        K = cal.get("camera_matrix")
+        D = cal.get("dist_coeffs")
+        if self._undistort and K is not None and D is not None:
+            try:
+                Kc = np.array(K, dtype=np.float64)
+                Kc[0, 2] -= cx_min * cap_w
+                Kc[1, 2] -= cy_min * cap_h
+                dist = np.asarray(D, dtype=np.float64).reshape(-1)
+                # Validate the model once so a bad coeff count can't crash the
+                # per-frame loop.
+                cv2.undistortPoints(
+                    np.array([[[10.0, 10.0]]], np.float32), Kc, dist, P=Kc
+                )
+                self._K_crop = Kc
+                self._dist = dist
+                print("[host_node] measurement undistortion ON "
+                      "(device K/dist loaded, principal point shifted to crop)")
+            except Exception as e:
+                print(f"[host_node] undistortion setup failed ({e}); measuring raw")
+                self._K_crop = None
+                self._dist = None
+        elif self._undistort:
+            print("[host_node] undistort_measurements set but camera_matrix/"
+                  "dist_coeffs missing — measuring raw (run setup Save first)")
+
+    def _undistort_scale(self, cx: float, cy: float, d: float = 5.0):
+        """Local linear magnification of the lens-undistortion map at crop
+        pixel (cx, cy). ~1.0 near the optical centre, departs from 1 toward the
+        distorted FOV edges. A kernel/pod is small vs the FOV, so a single scale
+        at its centroid corrects the whole silhouette to well within our error
+        budget. Returns (mean_scale, x_scale, y_scale)."""
+        pts = np.array(
+            [[[cx, cy]], [[cx + d, cy]], [[cx, cy + d]]], dtype=np.float32
+        )
+        und = cv2.undistortPoints(
+            pts, self._K_crop, self._dist, P=self._K_crop
+        ).reshape(-1, 2)
+        ax = float(np.hypot(*(und[1] - und[0])) / d)
+        ay = float(np.hypot(*(und[2] - und[0])) / d)
+        return 0.5 * (ax + ay), ax, ay
+
+    # ── Calibration log (per-frame crop-pixel measurements) ───────────────
+    def _open_calib_log(self):
+        if not self._calib_enabled:
+            return
+        try:
+            Path(self._output_dir).mkdir(parents=True, exist_ok=True)
+            safe = "".join(
+                c if c.isalnum() or c in "_-" else "_" for c in self._plot_name
+            )
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = Path(self._output_dir) / f"calib_{safe}_{ts}.csv"
+            self._calib_log = open(path, "w", encoding="utf-8")
+            # All measurements are in CROP PIXELS (pre-mm). crop_w/crop_h let
+            # the analysis normalise cx for the distortion-vs-position check.
+            self._calib_log.write(f"# crop_w={self._crop_w} crop_h={self._crop_h}\n")
+            self._calib_log.write(
+                "frame_idx,det_idx,cx,cy,length_px,width_px,area_px,"
+                "mask_meas,width_valid,conf\n"
+            )
+            self._calib_log.flush()
+            print(f"[host_node] calibration log -> {path}")
+        except Exception as e:
+            print(f"[host_node] calibration log open failed: {e}")
+            self._calib_log = None
+
+    def _close_calib_log(self):
+        if self._calib_log is not None:
+            try:
+                self._calib_log.flush()
+                self._calib_log.close()
+            except Exception:
+                pass
+            self._calib_log = None
+
     def run(self):
         self._init_geometry()
+        self._open_calib_log()
 
         while self.isRunning():
             try:
@@ -148,6 +255,13 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
             self._frames_processed += 1
             n_dets = len(msg.detections)
             if n_dets == 0:
+                # Still tick the tracker: an empty update advances track
+                # ageing so stale tracks die out (and coasting tracks keep
+                # moving) across detection-free frames, instead of
+                # lingering at their last position waiting to steal a
+                # future detection.
+                if self.tracker is not None:
+                    self.tracker.update([])
                 continue
 
             # Diagnostics on first frame with detections
@@ -213,7 +327,11 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
                 area = bbox_w * bbox_h
 
                 # Attempt mask-based measurements using cv2.minAreaRect
-                # for true oriented length/width (not axis-aligned extent)
+                # for true oriented length/width (not axis-aligned extent).
+                # mask_ok records whether the mask path succeeded — bbox
+                # fallback measurements are kept for tracking but flagged
+                # so they can't pollute the per-track aggregates.
+                mask_ok = False
                 try:
                     binary_mask = msg.getCvSegmentationMaskByIndex(det_idx)
                     if binary_mask is not None:
@@ -258,9 +376,15 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
                             # Use the largest contour (by area) if multiple
                             contour = max(contours, key=cv2.contourArea)
 
-                            # Mask area from contour (more accurate than
-                            # pixel count for sub-pixel contour edges)
-                            mask_area_px = cv2.contourArea(contour)
+                            # Mask area = pixel count of the largest blob
+                            # (holes filled).  cv2.contourArea integrates
+                            # the polygon through pixel centres and
+                            # under-counts small blobs by ~perimeter/2 px².
+                            blob = np.zeros_like(mask_arr)
+                            cv2.drawContours(
+                                blob, [contour], -1, 1, thickness=cv2.FILLED
+                            )
+                            mask_area_px = float(cv2.countNonZero(blob))
 
                             if mask_area_px > 0:
                                 # Convert mask px² → crop px²
@@ -288,8 +412,22 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
                                     mh_px = float(h_c) * self._mask_px_to_crop_px_len
                                     length = max(mw_px, mh_px)
                                     width = min(mw_px, mh_px)
+                                mask_ok = True
                 except Exception:
                     pass  # fall back to bbox measurements
+
+                # Optional lens-distortion correction: scale measured
+                # dimensions by the local undistortion magnification at the
+                # detection centroid. Positions (cx,cy) are left unchanged so
+                # tracking/counting behaviour is identical. No-op unless enabled.
+                if self._undistort and self._K_crop is not None:
+                    try:
+                        mscale, ax, ay = self._undistort_scale(cx, cy)
+                        length *= mscale
+                        width *= mscale
+                        area *= ax * ay
+                    except Exception:
+                        pass
 
                 if area < self._min_mask_area:
                     continue
@@ -298,6 +436,8 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
                     "bbox": (x1, y1, x2, y2),
                     "cx": int(cx), "cy": int(cy),
                     "length": length, "width": width, "area": area,
+                    "mask_ok": mask_ok,
+                    "conf": float(det.confidence),
                 })
 
             # ── Pass 2: width_valid = (not edge-touching) AND (no other
@@ -306,7 +446,7 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
             # them out of the width aggregate while still tracking them
             # (so counting/continuity is unaffected).
             frame_dets: List[dict] = []
-            for s in survivors:
+            for det_idx, s in enumerate(survivors):
                 sx1, sy1, sx2, sy2 = s["bbox"]
                 touches_edge = (
                     sx1 <= self._border_pad_px
@@ -321,7 +461,10 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
                     iou = _calculate_iou(s["bbox"], other["bbox"])
                     if iou > max_iou_other:
                         max_iou_other = iou
-                width_valid = not (
+                # Bbox-fallback widths are axis-aligned extents, not
+                # oriented widths — exclude them from the min-width
+                # aggregate alongside edge-clipped/occluded masks.
+                width_valid = s["mask_ok"] and not (
                     touches_edge
                     or max_iou_other >= self._overlap_iou_threshold
                 )
@@ -330,9 +473,35 @@ class PodTrackingNode(dai.node.ThreadedHostNode):
                     "cx": s["cx"], "cy": s["cy"],
                     "length": s["length"], "width": s["width"], "area": s["area"],
                     "width_valid": width_valid,
+                    "mask_meas": s["mask_ok"],
                 })
+
+                if self._calib_log is not None:
+                    try:
+                        self._calib_log.write(
+                            f"{self._frames_processed},{det_idx},"
+                            f"{s['cx']},{s['cy']},"
+                            f"{s['length']:.3f},{s['width']:.3f},{s['area']:.2f},"
+                            f"{int(s['mask_ok'])},{int(width_valid)},{s['conf']:.4f}\n"
+                        )
+                    except Exception as e:
+                        # Never let a logging hiccup take down tracking.
+                        print(f"[host_node] calib log write failed ({e}); disabling log")
+                        self._close_calib_log()
+
+            # Flush once per frame to the OS so a depthai native teardown crash
+            # (which skips our clean close) can't lose the whole recording.
+            if self._calib_log is not None:
+                try:
+                    self._calib_log.flush()
+                except Exception:
+                    pass
 
             self._dets_accepted += len(frame_dets)
 
-            if frame_dets and self.tracker is not None:
+            # Always tick the tracker, even when every detection was
+            # filtered out, so track ageing advances on every frame.
+            if self.tracker is not None:
                 self.tracker.update(frame_dets)
+
+        self._close_calib_log()
