@@ -68,11 +68,15 @@ def write_results_csv(
         "length_px",
         "width_px",
         "area_px2",
-        "length_mm",
+        "length_mm_raw",   # uncorrected: px / px_per_mm
+        "width_mm_raw",
+        "area_mm2_raw",
+        "length_mm",       # corrected: (px - k_px) / (px_per_mm * C)
         "width_mm",
-        "area_mm2",
+        "area_mm2",        # corrected (approx: raw / (C_w * C_l))
         "hunter_l",
         "width_quality",
+        "meas_quality",
         "plot_name",
         "plot_weight",
     ]
@@ -92,11 +96,17 @@ def write_results_csv(
             "length_px":     round(meas.length, 1),
             "width_px":      round(meas.width, 1),
             "area_px2":      round(meas.area, 1),
-            "length_mm":     round(calibration.px_to_mm(meas.length), 2),
-            "width_mm":      round(calibration.px_to_mm(meas.width), 2),
-            "area_mm2":      round(calibration.area_px_to_mm2(meas.area), 2),
+            "length_mm_raw": round(calibration.px_to_mm(meas.length), 2),
+            "width_mm_raw":  round(calibration.px_to_mm(meas.width), 2),
+            "area_mm2_raw":  round(calibration.area_px_to_mm2(meas.area), 2),
+            "length_mm":     round(calibration.corrected_length_mm(meas.length), 2),
+            "width_mm":      round(calibration.corrected_width_mm(meas.width), 2),
+            "area_mm2":      round(calibration.corrected_area_mm2(meas.area), 2),
             "hunter_l":      hunter_l,
             "width_quality": getattr(meas, "width_quality", "clean"),
+            # 'mask' = length/area from segmentation mask; 'bbox' = every
+            # frame fell back to the (larger) axis-aligned bounding box.
+            "meas_quality":  getattr(meas, "meas_quality", "mask"),
             "plot_name":     plot_name,
             "plot_weight":   plot_weight,
         })
