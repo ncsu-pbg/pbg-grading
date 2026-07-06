@@ -1,0 +1,36 @@
+# Line-ending policy for the repo — deterministic across Mac (LF) and
+# Windows (CRLF) editors, independent of anyone's core.autocrlf setting.
+# Git stores all text as LF; the working-tree ending is enforced per type.
+
+# Default: detect text, store as LF, check out as LF everywhere.
+* text=auto eol=lf
+
+# Source & config — always LF.
+*.py    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.cfg   text eol=lf
+*.toml  text eol=lf
+
+# Unix shell / macOS launchers — MUST be LF or they won't run.
+*.sh       text eol=lf
+*.command  text eol=lf
+
+# Windows scripts — CRLF in the working tree (cmd/PowerShell expect it).
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary assets — never convert or diff.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.xz    binary
+*.gz    binary
+*.tar   binary
+*.zip   binary
+*.blob  binary
