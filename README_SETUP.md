@@ -86,6 +86,11 @@ verify, commit, and let stations pull it.
   If the port is taken, set `PBG_PORT` in the launcher.
 - **Broken environment** (failed update, deleted files) — just re-run the
   setup script; it rebuilds `envs/grading` from scratch.
+- **App suddenly won't launch and `envs/grading` shrank** — if the station
+  folder lives inside Dropbox, Dropbox's space-saving can offload/delete
+  files out of the environment. The setup scripts mark `envs/` and
+  `.micromamba/` with Dropbox's ignore attribute to prevent this; re-run the
+  setup script to rebuild and re-apply the marker.
 - **`environment.yml` vs `config.yaml`** — the `.yml` file is the Python
   environment spec; the `.yaml` file is the runtime camera/calibration
   config. They are unrelated.

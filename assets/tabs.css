@@ -1,0 +1,12 @@
+/* Sample-entry tabs (QR Scan / Manual Entry) — same selected styling as the
+   QR Dash scan-method tabs: red pill for the active tab, grey for inactive. */
+#sample-entry-tabs .nav-link {
+    color: #6c757d;
+    font-weight: 500;
+}
+#sample-entry-tabs .nav-link.active {
+    background-color: #D9534F !important;
+    color: white !important;
+    border-color: #D9534F !important;
+    font-weight: bold;
+}

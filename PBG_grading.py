@@ -49,7 +49,7 @@ controller so wiring it later is a small change.
 
 import base64
 import collections
-import io
+import json
 import os
 import socket
 import sys
@@ -83,6 +83,8 @@ from calibration import Calibration, load_calibration
 from export import write_results_csv
 from pipeline.oak_pipeline import OakPipelineThread
 from dropbox_team_client import TeamDropboxClientManager
+from summary import (compute_summary, merge_summary_into_workbook, parse_plot,
+                     parse_qr, qr_to_sample_name, session_summary_table)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -177,10 +179,25 @@ class GradingController:
         self.last_csv_path: Optional[Path] = None
         self.last_error: Optional[str] = None
 
+        # Session persistence: every completed run rewrites this JSON under
+        # output/Sessions/, so an accidentally closed app loses nothing and a
+        # previous session can be reloaded later. Loading an old session
+        # repoints session_path so subsequent runs continue in that file.
+        self.sessions_dir = Path(cfg.get("output_dir", "./output")) / "Sessions"
+        self.session_path = (self.sessions_dir /
+                             f"session_{time.strftime('%Y%m%d_%H%M%S')}.json")
+
         # Set when a run is started, so _on_pipeline_stopped can label output.
         self._run_plot_name = ""
         self._run_plot_weight = ""
         self._run_mode = self.mode
+        self._run_plot = ""
+
+        # Plot registered for the NEXT run (QR scan or Manual Entry's "Set
+        # Sample Information"). Consumed once when a run starts; kept separate
+        # from the sample name, which is purely the operator's file/folder
+        # designation.
+        self.pending_plot: Optional[str] = None
 
         # Calibration: launched as a separate process (calibrate.py) so the
         # PyQt dialog gets its own QApplication / main thread.
@@ -335,8 +352,9 @@ class GradingController:
                 return (f"Model file for {label} mode not found:\n{model_path}\n"
                         f"Update modes.{mode}.model_path in config.yaml.")
 
-            # When saving frames, nest them in a subfolder named after the
-            # sample so each sample's images stay separate. If no parent
+            # When saving frames, nest them per sample AND per mode —
+            # <parent>/<Sample Name>/<Pod|Seed> Images — so grading the same
+            # sample with both cameras can't overwrite images. If no parent
             # folder is typed in, fall back to the configured output_dir, so
             # the sample name only needs to be entered once. (plot_name is
             # already validated as non-empty above.) The CSV is written to
@@ -348,7 +366,8 @@ class GradingController:
                 )
                 parent = (save_dir or "").strip() \
                     or self.cfg.get("output_dir", "./output")
-                effective_save_dir = str(Path(parent) / safe_sample)
+                img_sub = "Pod Images" if mode == "pod" else "Seed Images"
+                effective_save_dir = str(Path(parent) / safe_sample / img_sub)
 
             # Build the cfg the pipeline expects (per-mode block + a couple of
             # globals merged in), exactly like main_window._on_start.
@@ -366,6 +385,11 @@ class GradingController:
             self._run_plot_name = plot_name
             self._run_plot_weight = (plot_weight or "").strip()
             self._run_mode = mode
+            # Plot for the Dropbox append: an explicitly registered plot wins
+            # (Manual Entry / QR scan); otherwise fall back to a plot-suffixed
+            # sample name. One-shot — cleared so it can't leak into later runs.
+            self._run_plot = self.pending_plot or parse_plot(plot_name) or ""
+            self.pending_plot = None
             self._log(f"Mode: {label}  |  Sample: {plot_name}  |  "
                       f"Weight: {self._run_plot_weight or '(none)'}")
 
@@ -441,6 +465,7 @@ class GradingController:
                 "n": len(self.session) + 1,
                 "mode": label,
                 "plot_name": name,
+                "plot": self._run_plot,
                 "weight": f"{weight}g" if weight else "",
                 "count": n_tracks,
                 "elapsed": elapsed,
@@ -448,6 +473,56 @@ class GradingController:
             })
             self.running = False
             self.run_start = None
+        self._persist_session()
+
+    # ── session persistence ──────────────────────────────────────────────────
+    def _persist_session(self) -> None:
+        """Rewrite the session file after every run (crash/close safeguard)."""
+        with self._lock:
+            runs = list(self.session)
+            path = self.session_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "runs": runs}
+            path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — never let IO kill the run flow
+            self._log(f"WARNING: could not save session file: {e}")
+
+    def list_sessions(self) -> List[dict]:
+        """Saved sessions, newest first: {path, label, n_runs}."""
+        out = []
+        for p in sorted(self.sessions_dir.glob("session_*.json"), reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                runs = data.get("runs", [])
+                ts = time.strftime("%b %d %Y, %H:%M",
+                                   time.strptime(p.stem, "session_%Y%m%d_%H%M%S"))
+                out.append({"path": str(p), "n_runs": len(runs),
+                            "label": f"{ts} — {len(runs)} run(s)"})
+            except Exception:  # noqa: BLE001 — skip unreadable files
+                continue
+        return out
+
+    def load_session(self, path: str) -> tuple[int, Optional[str]]:
+        """Replace the in-memory session with a saved one and resume it.
+
+        Returns (n_runs, error). Safe even mid-testing: the current session is
+        already on disk (every run persists), so nothing is lost by switching.
+        """
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            runs = data.get("runs", [])
+            if not isinstance(runs, list):
+                return 0, "Not a session file."
+        except Exception as e:  # noqa: BLE001
+            return 0, f"Could not read session: {e}"
+        with self._lock:
+            if self.running:
+                return 0, "Stop the camera before loading a session."
+            self.session = runs
+            self.session_path = Path(path)   # new runs continue in this file
+        return len(runs), None
 
     def _on_error(self, message: str) -> None:
         self._log(f"\nERROR: {message}")
@@ -490,6 +565,8 @@ class GradingController:
                 "session": list(self.session),
                 "last_csv": str(self.last_csv_path) if self.last_csv_path else "",
                 "last_sample": self._run_plot_name,
+                "last_mode": self._run_mode,
+                "last_weight": self._run_plot_weight,
                 "error": self.last_error,
             }
 
@@ -564,8 +641,12 @@ def build_distribution_figure(df: pd.DataFrame, metric: str,
     x_label = METRIC_LABELS.get(metric, metric)
 
     # Grade bands only apply to width, and only for pod / seed recordings.
-    grade = GRADE_REFERENCE.get((mode_label or "").lower()) \
-        if metric == "width_mm" else None
+    # Match by prefix: labels can carry the sample name too ("Pod — <sample>"
+    # for a selected session row), which must not lose the bands.
+    _ml = (mode_label or "").lower()
+    grade = (next((v for k, v in GRADE_REFERENCE.items() if _ml.startswith(k)),
+                  None)
+             if metric == "width_mm" else None)
 
     # Visible x-range (with a little padding); bands are clipped to this so
     # they never extend into empty space.
@@ -685,14 +766,6 @@ def summary_cards(df: pd.DataFrame, metric: str) -> list:
     ]
 
 
-def _df_from_upload(contents: str) -> Optional[pd.DataFrame]:
-    try:
-        _, b64 = contents.split(",", 1)
-        return pd.read_csv(io.BytesIO(base64.b64decode(b64)))
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _mode_label_from_name(name: str) -> str:
     n = (name or "").lower()
     if n.startswith("seed"):
@@ -720,10 +793,14 @@ HEADER_STYLE = {"backgroundColor": "#CC0000", "color": "white",
                 "fontWeight": "bold", "padding": "8px 12px", "fontSize": "13px"}
 CARD_STYLE = {"border": "1px solid #ddd", "borderRadius": "6px",
               "marginBottom": "16px"}
-BTN_PRIMARY = {"backgroundColor": "#CC0000", "border": "none", "color": "white",
-               "fontWeight": "bold"}
-BTN_BLACK = {"backgroundColor": "#000", "border": "none", "color": "white",
+# One color scheme for the whole app: every button charcoal, except
+# Start Camera (green) and Stop Camera (red).
+BTN_DARK = {"backgroundColor": "#3b4045", "border": "none", "color": "white",
+            "fontWeight": "bold"}
+BTN_GREEN = {"backgroundColor": "#2f9e44", "border": "none", "color": "white",
              "fontWeight": "bold"}
+BTN_RED = {"backgroundColor": "#CC0000", "border": "none", "color": "white",
+           "fontWeight": "bold"}
 LABEL_STYLE = {"fontWeight": "bold", "fontSize": "12px", "marginBottom": "4px",
                "color": "#333"}
 
@@ -749,6 +826,8 @@ app.layout = dbc.Container([
     dcc.Store(id="viz-store", data=None),
     dcc.Store(id="fb-path", data=DROPBOX_ROOT, storage_type="session"),
     dcc.Store(id="fb-selected-folder", data=DROPBOX_DEFAULT_DEST),
+    dcc.Store(id="afb-path", data=DROPBOX_ROOT, storage_type="session"),
+    dcc.Store(id="afb-selected", data="", storage_type="session"),
 
     # Header
     dbc.Row(dbc.Col(html.Div([html.Center([
@@ -772,7 +851,7 @@ app.layout = dbc.Container([
                         value=CONTROLLER.mode,
                     ), width="auto"),
                     dbc.Col(dbc.Button("Refresh", id="refresh-btn", size="sm",
-                                       color="secondary", outline=True),
+                                       style=BTN_DARK),
                             width="auto", className="ms-auto"),
                 ], className="g-2 align-items-center"),
                 html.Div(id="source-status", className="small mt-2",
@@ -780,57 +859,108 @@ app.layout = dbc.Container([
             ]),
 
             _card("Sample Information", [
+                # QR Dash-style entry tabs: scan a tag, or type the plot data.
+                # Both routes just populate the Sample Name field below.
+                dbc.Tabs([
+                    dbc.Tab([
+                        dbc.Row([
+                            dbc.Col(html.Span("QR Scan:", style=LABEL_STYLE),
+                                    width="auto", className="pt-1"),
+                            dbc.Col(dbc.Input(
+                                id="qr-scan", size="sm", autofocus=True,
+                                debounce=True, autocomplete="off",
+                                placeholder="Click here, then scan tag…")),
+                        ], className="g-2 mb-1 mt-2 align-items-center"),
+                        html.Div(id="qr-scan-result", className="small mb-2",
+                                 style={"minHeight": "1em"}),
+                    ], label="QR Scan", tab_id="tab-qr"),
+                    dbc.Tab([
+                        dbc.Row([
+                            dbc.Col([html.Div("Year", style=LABEL_STYLE),
+                                     dbc.Input(id="man-year", size="sm",
+                                               placeholder="2026")], md=6),
+                            dbc.Col([html.Div("Location", style=LABEL_STYLE),
+                                     dbc.Input(id="man-loc", size="sm",
+                                               placeholder="LEW")], md=6),
+                        ], className="g-2 mb-2 mt-2"),
+                        dbc.Row([
+                            dbc.Col([html.Div("NC Accession", style=LABEL_STYLE),
+                                     dbc.Input(id="man-acc", size="sm",
+                                               placeholder="N19003")], md=6),
+                            dbc.Col([html.Div("Name", style=LABEL_STYLE),
+                                     dbc.Input(id="man-name", size="sm",
+                                               placeholder="Bailey")], md=6),
+                        ], className="g-2 mb-2"),
+                        dbc.Row([
+                            dbc.Col([html.Div("Plot (required)",
+                                              style=LABEL_STYLE),
+                                     dbc.Input(id="man-plot", size="sm",
+                                               placeholder="101")], md=6),
+                        ], className="g-2 mb-4"),
+                    ], label="Manual Entry", tab_id="tab-manual"),
+                ], id="sample-entry-tabs", active_tab="tab-qr",
+                   className="mb-2"),
                 dbc.Row([
-                    dbc.Col(html.Span("Sample Name:", style=LABEL_STYLE), width=4,
-                            className="pt-1"),
+                    dbc.Col(html.Span(["Sample Name",
+                                       html.Span(" *", style={"color": "#CC0000"}),
+                                       ":"], style=LABEL_STYLE,
+                                      title="Required — a run cannot start "
+                                            "without a sample name."),
+                            width="auto", className="pt-1"),
                     dbc.Col(dbc.Input(id="plot-name", placeholder="e.g. Sample 1",
-                                      size="sm"), width=8),
+                                      size="sm")),
                 ], className="g-2 mb-2 align-items-center"),
                 dbc.Row([
-                    dbc.Col(html.Span("Sample Weight:", style=LABEL_STYLE), width=4,
-                            className="pt-1"),
+                    dbc.Col(html.Span("Sample Weight:", style=LABEL_STYLE),
+                            width="auto", className="pt-1"),
                     dbc.Col(dbc.InputGroup([
                         dbc.Input(id="plot-weight", placeholder="e.g. 100",
                                   type="number", size="sm"),
                         dbc.InputGroupText("g"),
-                    ], size="sm"), width=8),
+                    ], size="sm")),
                 ], className="g-2 align-items-center"),
+                dbc.Button("Set Sample Information", id="btn-manual-set",
+                           style=BTN_DARK, size="sm",
+                           className="w-100 mt-3 mb-1"),
+                html.Div(id="manual-result", className="small",
+                         style={"minHeight": "1em"}),
             ]),
 
             _card("Frame Saving", [
                 dbc.Checkbox(id="save-frames", label="Save Frames to Disk",
                              value=False, className="mb-2"),
                 dbc.Input(id="save-path", size="sm", disabled=True,
-                          placeholder="Optional — Default: Output/[Sample Name]"),
+                          placeholder="Optional — Default: Output/[Sample Name]/"
+                                      "[Pod or Seed] Images"),
             ]),
 
             _card("Camera Controls", [
                 dbc.Row([
                     dbc.Col(dbc.Button([html.I(className="bi bi-aspect-ratio me-1"),
                                         "Initial Camera Setup"],
-                                       id="btn-initial", color="secondary",
-                                       outline=True, size="sm",
+                                       id="btn-initial", style=BTN_DARK,
+                                       size="sm",
                                        className="w-100"), md=6,
                             className="mb-2"),
                     dbc.Col(dbc.Button([html.I(className="bi bi-bullseye me-1"),
                                         "Target Calibration"],
-                                       id="btn-target", color="secondary",
-                                       outline=True, size="sm",
+                                       id="btn-target", style=BTN_DARK,
+                                       size="sm",
                                        className="w-100"), md=6,
                             className="mb-2"),
                 ], className="g-2"),
                 dbc.Row([
                     dbc.Col(dbc.Button([html.I(className="bi bi-play-fill me-1"),
                                         "Start Camera"], id="btn-start",
-                                       style=BTN_PRIMARY, className="w-100"), md=4,
+                                       style=BTN_GREEN, className="w-100"), md=4,
                             className="mb-2"),
                     dbc.Col(dbc.Button([html.I(className="bi bi-stop-fill me-1"),
                                         "Stop Camera"], id="btn-stop",
-                                       style=BTN_BLACK, className="w-100",
+                                       style=BTN_RED, className="w-100",
                                        disabled=True), md=4, className="mb-2"),
                     dbc.Col(dbc.Button([html.I(className="bi bi-arrow-repeat me-1"),
                                         "Next Sample"], id="btn-next",
-                                       color="secondary", outline=True,
+                                       style=BTN_DARK,
                                        className="w-100"), md=4, className="mb-2"),
                 ], className="g-2"),
                 html.Div(id="action-alert", className="mt-1"),
@@ -870,20 +1000,43 @@ app.layout = dbc.Container([
 
         # ── RIGHT: history + visualization + export ───────────────────────────
         dbc.Col([
-            _card("Session History", dash_table.DataTable(
-                id="session-table",
-                columns=[{"name": c, "id": i} for c, i in [
-                    ("#", "n"), ("Mode", "mode"), ("Sample", "plot_name"),
-                    ("Weight", "weight"), ("Count", "count"),
-                    ("Duration", "elapsed"), ("CSV File", "csv_file")]],
-                data=[], style_table={"overflowX": "auto"},
-                style_cell={"fontSize": "11px", "padding": "5px",
-                            "textAlign": "center"},
-                style_header={"backgroundColor": "#CC0000", "color": "white",
-                              "fontWeight": "bold"},
-                style_data_conditional=[{"if": {"row_index": "odd"},
-                                         "backgroundColor": "#f9f9f9"}],
-            )),
+            _card("Session History", [
+                dash_table.DataTable(
+                    id="session-table",
+                    columns=[{"name": c, "id": i} for c, i in [
+                        ("#", "n"), ("Mode", "mode"), ("Sample", "plot_name"),
+                        ("Weight", "weight"), ("Count", "count"),
+                        ("Duration", "elapsed"), ("CSV File", "csv_file")]],
+                    data=[], row_selectable="single", selected_rows=[],
+                    page_size=10,
+                    style_table={"overflowX": "auto"},
+                    style_cell={"fontSize": "11px", "padding": "5px",
+                                "textAlign": "center"},
+                    style_header={"backgroundColor": "#CC0000", "color": "white",
+                                  "fontWeight": "bold"},
+                    style_data_conditional=[{"if": {"row_index": "odd"},
+                                             "backgroundColor": "#f9f9f9"}],
+                ),
+                html.Div("Select a row to view that run and use it for "
+                         "downloads; deselect for the latest run.",
+                         className="text-muted", style={"fontSize": "11px"},
+                         id="session-hint"),
+                html.Hr(className="my-2"),
+                dbc.Row([
+                    dbc.Col(dcc.Dropdown(id="session-select", options=[],
+                                         placeholder="Previous sessions…",
+                                         style={"fontSize": "12px"}), md=7),
+                    dbc.Col(dbc.Button("Load Session", id="btn-load-session",
+                                       style=BTN_DARK, size="sm",
+                                       className="w-100"), md=3),
+                    dbc.Col(dbc.Button(html.I(className="bi bi-arrow-clockwise"),
+                                       id="btn-refresh-sessions", size="sm",
+                                       style=BTN_DARK,
+                                       className="w-100",
+                                       title="Refresh session list"), md=2),
+                ], className="g-2 align-items-center"),
+                html.Div(id="session-load-result", className="small mt-1"),
+            ]),
 
             _card("Width Distribution", [
                 dbc.Row([
@@ -892,7 +1045,7 @@ app.layout = dbc.Container([
                         dbc.RadioItems(
                             id="viz-source", inline=True,
                             options=[{"label": "Latest Record", "value": "latest"},
-                                     {"label": "Upload CSV", "value": "upload"}],
+                                     {"label": "Selected Run", "value": "selected"}],
                             value="latest"),
                     ], md=6),
                     dbc.Col([
@@ -905,14 +1058,11 @@ app.layout = dbc.Container([
                             style={"fontSize": "12px"}),
                     ], md=6),
                 ], className="g-2 mb-2 align-items-end"),
-                dcc.Upload(id="viz-upload", children=html.Div(
-                    ["Drag & Drop or ", html.A("Select CSV")]),
-                    style={"display": "none"}),
                 dcc.Graph(id="viz-graph", config={"displaylogo": False}),
                 dbc.Row(id="viz-stats", className="g-2 mt-1"),
             ]),
 
-            _card("Download Recording", [
+            _card("Download CSV", [
                 dbc.Row([
                     dbc.Col([
                         html.Div("File Name", style=LABEL_STYLE),
@@ -923,10 +1073,17 @@ app.layout = dbc.Container([
                         dbc.Button([html.I(className="bi bi-download me-1"),
                                     "Download to Computer"],
                                    id="btn-local-download",
-                                   style=BTN_PRIMARY, className="w-100",
+                                   style=BTN_DARK, className="w-100",
                                    size="sm"),
                         md=5, className="d-flex align-items-end"),
                 ], className="g-2 mb-1 align-items-end"),
+                dbc.Button([html.I(className="bi bi-table me-1"),
+                            "Download Session Summary"],
+                           id="btn-summary-download", style=BTN_DARK,
+                           className="w-100 mt-2", size="sm",
+                           title="One summarized row per plot (same numbers "
+                                 "the trial-file append writes) for every run "
+                                 "in the session — current or loaded."),
                 dcc.Download(id="local-download"),
                 html.Div(id="local-result", className="mt-2"),
             ]),
@@ -939,7 +1096,7 @@ app.layout = dbc.Container([
                             dbc.Input(id="dropbox-folder", value=DROPBOX_DEFAULT_DEST,
                                       size="sm", readonly=True),
                             dbc.Button("Browse…", id="fb-open", size="sm",
-                                       color="dark"),
+                                       style=BTN_DARK),
                         ]),
                     ], md=7),
                     dbc.Col([
@@ -948,20 +1105,40 @@ app.layout = dbc.Container([
                                   placeholder="e.g. Sample 1 - Default: [Sample Name]"),
                     ], md=5),
                 ], className="g-2 mb-2 align-items-end"),
+                dbc.Button([html.I(className="bi bi-cloud-upload me-1"),
+                            "Download to Dropbox"],
+                           id="btn-dropbox-download",
+                           style=BTN_DARK, className="w-100 mb-2",
+                           size="sm"),
+                dbc.Button([html.I(className="bi bi-table me-1"),
+                            "Upload Session Summary"],
+                           id="btn-dropbox-summary",
+                           style=BTN_DARK, className="w-100 mb-2",
+                           size="sm",
+                           title="Upload one summarized row per plot for the "
+                                 "whole session (current or loaded) as a CSV "
+                                 "to the destination folder."),
+                html.Hr(className="my-2"),
                 dbc.Row([
-                    dbc.Col(dbc.Button([html.I(className="bi bi-cloud-upload me-1"),
-                                        "Download to Dropbox"],
-                                       id="btn-dropbox-download",
-                                       style=BTN_PRIMARY, className="w-100",
-                                       size="sm"), md=6),
-                    dbc.Col(dbc.Button([html.I(className="bi bi-file-earmark-plus me-1"),
-                                        "Append to Dropbox File"],
-                                       id="btn-dropbox-append",
-                                       color="secondary", className="w-100",
-                                       size="sm", disabled=True,
-                                       title="Coming soon — requires a summary step"),
-                            md=6),
-                ], className="g-2"),
+                    dbc.Col([
+                        html.Div("Trial File (.xlsx)", style=LABEL_STYLE),
+                        dbc.InputGroup([
+                            dbc.Input(id="append-file", size="sm", readonly=True,
+                                      placeholder="No file selected"),
+                            dbc.Button("Browse…", id="afb-open", size="sm",
+                                       style=BTN_DARK),
+                        ]),
+                    ]),
+                ], className="g-2 mb-2 align-items-end"),
+                dbc.Button([html.I(className="bi bi-file-earmark-plus me-1"),
+                            "Append to Dropbox File"],
+                           id="btn-dropbox-append",
+                           style=BTN_DARK, className="w-100",
+                           size="sm",
+                           title="Append every run from this session to the "
+                                 "selected trial file — each summary (mean/"
+                                 "variance/skewness/kurtosis) fills its own "
+                                 "Plot's row"),
                 html.Div(id="dropbox-result", className="mt-2"),
             ]),
         ], lg=7),
@@ -979,19 +1156,37 @@ app.layout = dbc.Container([
         dbc.ModalBody([
             dbc.ButtonGroup([
                 dbc.Button([html.I(className="bi bi-house me-1"), "Root"],
-                           id="fb-root", size="sm", color="secondary", outline=True),
+                           id="fb-root", size="sm", style=BTN_DARK),
                 dbc.Button([html.I(className="bi bi-arrow-up me-1"), "Up"],
-                           id="fb-up", size="sm", color="secondary", outline=True),
+                           id="fb-up", size="sm", style=BTN_DARK),
             ], className="mb-2"),
             html.Div(id="fb-current", className="small text-muted mb-2"),
             html.Div(id="fb-listing",
                      style={"maxHeight": "320px", "overflowY": "auto"}),
         ]),
         dbc.ModalFooter([
-            dbc.Button("Cancel", id="fb-cancel", color="secondary", size="sm"),
-            dbc.Button("Use This Folder", id="fb-confirm", color="dark", size="sm"),
+            dbc.Button("Cancel", id="fb-cancel", style=BTN_DARK, size="sm"),
+            dbc.Button("Use This Folder", id="fb-confirm", style=BTN_DARK, size="sm"),
         ]),
     ], id="fb-modal", size="lg", is_open=False),
+
+    # Trial-file browser modal (append target — folders navigate, .xlsx selects)
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Select Trial File (.xlsx)")),
+        dbc.ModalBody([
+            dbc.ButtonGroup([
+                dbc.Button([html.I(className="bi bi-house me-1"), "Root"],
+                           id="afb-root", size="sm", style=BTN_DARK),
+                dbc.Button([html.I(className="bi bi-arrow-up me-1"), "Up"],
+                           id="afb-up", size="sm", style=BTN_DARK),
+            ], className="mb-2"),
+            html.Div(id="afb-current", className="small text-muted mb-2"),
+            html.Div(id="afb-listing",
+                     style={"maxHeight": "320px", "overflowY": "auto"}),
+        ]),
+        dbc.ModalFooter(
+            dbc.Button("Cancel", id="afb-cancel", style=BTN_DARK, size="sm")),
+    ], id="afb-modal", size="lg", is_open=False),
 
     html.Footer("© 2026 Peanut Breeding & Genetics",
                 className="text-center text-muted small mb-4"),
@@ -1163,47 +1358,102 @@ def on_next(_n, name):
     return nxt, None
 
 
-# ── Visualization: upload visibility ─────────────────────────────────────────
+# ── Sessions: list / load previous sessions ──────────────────────────────────
 @app.callback(
-    Output("viz-upload", "style"),
-    Input("viz-source", "value"),
+    Output("session-select", "options"),
+    Input("btn-refresh-sessions", "n_clicks"),
+)   # also fires at page load, so the list is ready without clicking refresh
+def refresh_sessions(_n):
+    return [{"label": s["label"], "value": s["path"]}
+            for s in CONTROLLER.list_sessions()]
+
+
+@app.callback(
+    Output("session-load-result", "children"),
+    Output("session-table", "selected_rows"),
+    Input("btn-load-session", "n_clicks"),
+    State("session-select", "value"),
+    prevent_initial_call=True,
 )
-def toggle_upload(src):
-    if src == "upload":
-        return {"border": "1px dashed #bbb", "borderRadius": "5px",
-                "padding": "10px", "textAlign": "center", "marginBottom": "8px",
-                "fontSize": "12px", "color": "#666"}
-    return {"display": "none"}
+def load_session_cb(_n, path):
+    if not path:
+        return (html.Span("Choose a session first.", className="text-warning"),
+                dash.no_update)
+    n, err = CONTROLLER.load_session(path)
+    if err:
+        return html.Span(err, className="text-danger"), dash.no_update
+    return (html.Span(f"✓ Loaded {n} run(s) — new runs will continue in this "
+                      "session; select a row to view/export a run.",
+                      className="text-success"), [])
+
+
+# Selecting a history row switches the plot to that run; deselecting returns
+# to the latest run.
+@app.callback(
+    Output("viz-source", "value"),
+    Input("session-table", "selected_rows"),
+    State("viz-source", "value"),
+    prevent_initial_call=True,
+)
+def on_row_select(rows, src):
+    if rows:
+        return "selected"
+    return "latest" if src == "selected" else dash.no_update
+
+
+def _resolve_export_run(selected_rows):
+    """(csv_path, sample_name) for the selected history row, else latest run.
+
+    Returns (None, None) when there is nothing to export.
+    """
+    snap = CONTROLLER.snapshot()
+    runs = snap["session"]
+    if selected_rows:
+        i = selected_rows[0]
+        if 0 <= i < len(runs):
+            r = runs[i]
+            csvf = r.get("csv_file")
+            if csvf and csvf != "(none)":
+                p = Path(CONTROLLER.cfg.get("output_dir", "./output")) / csvf
+                if p.exists():
+                    return p, (r.get("plot_name") or "").strip()
+        return None, None
+    last = snap["last_csv"]
+    if last and Path(last).exists():
+        return Path(last), (snap.get("last_sample") or "").strip()
+    return None, None
 
 
 # ── Visualization: load data into the store ──────────────────────────────────
 @app.callback(
     Output("viz-store", "data"),
     Input("viz-source", "value"),
-    Input("viz-upload", "contents"),
+    Input("session-table", "selected_rows"),
     Input("poll", "n_intervals"),
-    State("viz-upload", "filename"),
     State("viz-store", "data"),
 )
-def load_viz_data(src, upload_contents, _n, upload_name, current):
-    trig = dash.ctx.triggered_id
+def load_viz_data(src, selected_rows, _n, current):
+    if src == "selected" and selected_rows:
+        # A history row (current or loaded session) — read its raw CSV.
+        runs = CONTROLLER.snapshot()["session"]
+        if selected_rows[0] < len(runs):
+            r = runs[selected_rows[0]]
+            csvf = r.get("csv_file")
+            if csvf and csvf != "(none)":
+                p = Path(CONTROLLER.cfg.get("output_dir", "./output")) / csvf
+                if current and current.get("source") == str(p):
+                    return dash.no_update  # already showing; ignore the poll
+                try:
+                    df = pd.read_csv(p)
+                    return {"label": f"{r.get('mode', '')} — "
+                                     f"{r.get('plot_name', '')}",
+                            "records": df.to_dict("records"),
+                            "source": str(p)}
+                except Exception:  # noqa: BLE001
+                    pass
+        # Selected row unusable (no CSV / stale index) → fall back to latest.
 
-    if src == "upload":
-        if upload_contents is None:
-            # Switched to "upload" but nothing dropped yet — keep current view.
-            return dash.no_update
-        src_id = upload_name or "upload"
-        # Only (re)parse when the upload actually changed; ignore the 1 s poll
-        # so the figure doesn't redraw (and reset) every second.
-        if current and current.get("source") == src_id and trig == "poll":
-            return dash.no_update
-        df = _df_from_upload(upload_contents)
-        if df is None:
-            return dash.no_update
-        return {"label": _mode_label_from_name(upload_name),
-                "records": df.to_dict("records"), "source": src_id}
-
-    # latest recording
+    # latest recording (default whenever nothing valid is selected)
     last = CONTROLLER.snapshot()["last_csv"]
     if not last:
         return None if current is not None else dash.no_update
@@ -1310,28 +1560,331 @@ def fb_render(path, is_open):
     return rows, disp
 
 
+# ── QR scan: handheld reader types Year|Location|NC_Accession|Name|Plot ──────
+# The reader emulates a keyboard into the focused QR box and ends with Enter;
+# debounce=True fires this callback on that Enter (or on blur for readers that
+# send Tab). The payload becomes the underscore sample name, which drives the
+# raw CSV name, the image folder, and the auto-Plot at append time.
+@app.callback(
+    Output("plot-name", "value", allow_duplicate=True),
+    Output("qr-scan", "value"),
+    Output("qr-scan-result", "children"),
+    Output("man-year", "value"),
+    Output("man-loc", "value"),
+    Output("man-acc", "value"),
+    Output("man-name", "value"),
+    Output("man-plot", "value"),
+    Input("qr-scan", "value"),
+    prevent_initial_call=True,
+)
+def qr_scanned(text):
+    if not (text or "").strip():
+        return (dash.no_update,) * 8
+    qr = parse_qr(text)
+    if qr is None:
+        return (dash.no_update, dash.no_update,
+                html.Span("Unrecognized QR — expected "
+                          "Year|Location|Accession|Name|Plot",
+                          className="text-danger"),
+                dash.no_update, dash.no_update, dash.no_update,
+                dash.no_update, dash.no_update)
+    # Mirror the parsed payload into the Manual Entry fields so the operator
+    # can see/correct it and "Set Sample Information" is already satisfied.
+    fields = (qr["Year"], qr["Location"], qr["NC_Accession"],
+              qr["Name"], qr["Plot"])
+    name = qr_to_sample_name(text)
+    msg = (f"✓ Plot {qr['Plot']} — {qr['Name']} "
+           f"({qr['Year']} {qr['Location']}, {qr['NC_Accession']})")
+    if not qr["Plot"].isdigit():
+        CONTROLLER.pending_plot = None
+        return (name, "", html.Span(
+            msg + " — warning: Plot is not a number, so Dropbox append "
+                  "won't match it automatically.", className="text-warning"),
+            *fields)
+    # Register the scanned plot for the next run (supersedes any manual set).
+    CONTROLLER.pending_plot = qr["Plot"]
+    return (name, "", html.Span(msg, className="text-success"), *fields)
+
+
+# ── Manual entry: register the plot for the next run ─────────────────────────
+# The Sample Name stays the operator's own file/folder designation — this
+# never overwrites it. Plot (numeric) is what the Dropbox append merges on;
+# it's registered here and consumed by the next run. Year/Location/Accession/
+# Name are optional context and may be left blank.
+@app.callback(
+    Output("manual-result", "children"),
+    Input("btn-manual-set", "n_clicks"),
+    State("man-plot", "value"),
+    State("plot-name", "value"),
+    prevent_initial_call=True,
+)
+def manual_set(_n, plot, sample_name):
+    plot = str(plot).strip() if plot else ""
+    sample_name = (sample_name or "").strip()
+    if not plot or not sample_name:
+        return html.Span("Plot and Sample Name are both required.",
+                         className="text-danger")
+    if not plot.isdigit():
+        return html.Span("Plot must be a whole number.",
+                         className="text-danger")
+    CONTROLLER.pending_plot = plot
+    return html.Span(f"✓ Set — files named '{sample_name}', data appends to "
+                     f"Plot {plot}.", className="text-success")
+
+
+# ── Trial-file browser (append target) ───────────────────────────────────────
+@app.callback(
+    Output("afb-modal", "is_open"),
+    Output("append-file", "value"),
+    Output("afb-selected", "data"),
+    Input("afb-open", "n_clicks"),
+    Input("afb-cancel", "n_clicks"),
+    Input({"type": "afb-file", "path": dash.ALL}, "n_clicks"),
+    State("afb-selected", "data"),
+    prevent_initial_call=True,
+)
+def afb_modal(open_c, cancel_c, file_clicks, selected):
+    trig = dash.ctx.triggered_id
+    if trig == "afb-open":
+        return True, dash.no_update, dash.no_update
+    if isinstance(trig, dict) and trig.get("type") == "afb-file":
+        # Ignore the phantom trigger fired when the listing (re)renders and
+        # its pattern components are created with n_clicks=0.
+        if not dash.ctx.triggered[0]["value"]:
+            raise dash.exceptions.PreventUpdate
+        return False, trig["path"], trig["path"]
+    return False, dash.no_update, selected  # cancel
+
+
+@app.callback(
+    Output("afb-path", "data"),
+    Input("afb-open", "n_clicks"),
+    Input("afb-root", "n_clicks"),
+    Input("afb-up", "n_clicks"),
+    Input({"type": "afb-folder", "path": dash.ALL}, "n_clicks"),
+    State("afb-path", "data"),
+    prevent_initial_call=True,
+)
+def afb_navigate(open_c, root_c, up_c, folder_clicks, cur_path):
+    trig = dash.ctx.triggered_id
+    if trig in ("afb-open", "afb-root"):
+        return DROPBOX_ROOT
+    if trig == "afb-up":
+        parent = "/".join((cur_path or DROPBOX_ROOT).rstrip("/").split("/")[:-1])
+        return parent or DROPBOX_ROOT
+    if isinstance(trig, dict) and trig.get("type") == "afb-folder":
+        if not dash.ctx.triggered[0]["value"]:
+            raise dash.exceptions.PreventUpdate
+        return trig["path"]
+    return cur_path or DROPBOX_ROOT
+
+
+@app.callback(
+    Output("afb-listing", "children"),
+    Output("afb-current", "children"),
+    Input("afb-path", "data"),
+    Input("afb-modal", "is_open"),
+)
+def afb_render(path, is_open):
+    if not is_open:
+        return [], ""
+    path = path or DROPBOX_ROOT
+    disp = path if path else "/  (NC State PB&G team-space root)"
+    if team_manager is None:
+        return html.Div("Dropbox client not configured.",
+                        className="text-danger small"), disp
+    try:
+        items = team_manager.get_folder_contents(path)
+    except Exception as e:  # noqa: BLE001
+        return html.Div(f"Error: {e}", className="text-danger small"), disp
+    folders = sorted([i for i in items if i["type"] == "folder"],
+                     key=lambda x: x["name"].lower())
+    files = sorted([i for i in items if i["type"] == "file"
+                    and i["name"].lower().endswith(".xlsx")],
+                   key=lambda x: x["name"].lower())
+    rows = [
+        html.Div([html.I(className="bi bi-folder-fill me-2",
+                         style={"color": "#CC0000"}), f["name"]],
+                 id={"type": "afb-folder", "path": f["path"]},
+                 n_clicks=0, className="fb-item",
+                 style={"cursor": "pointer", "padding": "6px 8px"})
+        for f in folders
+    ] + [
+        html.Div([html.I(className="bi bi-file-earmark-spreadsheet me-2",
+                         style={"color": "#1a7f37"}), f["name"]],
+                 id={"type": "afb-file", "path": f["path"]},
+                 n_clicks=0, className="fb-item",
+                 style={"cursor": "pointer", "padding": "6px 8px"})
+        for f in files
+    ]
+    if not rows:
+        rows = [html.Div("No subfolders or .xlsx files.",
+                         className="text-muted small p-2")]
+    return rows, disp
+
+
+# ── Dropbox: append session summaries to the selected trial file, by Plot ────
+# Appends EVERY completed run from this session in one download → merge-all →
+# upload cycle. Each run's Plot comes from its own sample name (QR scan and
+# manual entry both guarantee a trailing plot number). Re-appending is
+# idempotent — identical values fill the same cells; if a plot was graded
+# twice, the later run wins.
+@app.callback(
+    Output("dropbox-result", "children", allow_duplicate=True),
+    Input("btn-dropbox-append", "n_clicks"),
+    State("append-file", "value"),
+    prevent_initial_call=True,
+)
+def dropbox_append(_n, file_path):
+    def _alert(msg, color):
+        return dbc.Alert(msg, color=color, dismissable=True,
+                         className="small mb-0")
+    if team_manager is None:
+        return _alert("Dropbox client not configured (check .env).", "danger")
+    if not (file_path or "").strip():
+        return _alert("Choose a trial file first (Browse…).", "warning")
+
+    snap = CONTROLLER.snapshot()
+    runs = [r for r in snap["session"]
+            if r.get("csv_file") and r["csv_file"] != "(none)"]
+    if not runs:
+        return _alert("No completed runs this session yet.", "warning")
+
+    out_dir = Path(CONTROLLER.cfg.get("output_dir", "./output"))
+
+    # Resolve each run's plot (registered at scan / Set Sample Information,
+    # with a plot-suffixed sample name as fallback) + its CSV.
+    todo, skipped = [], []
+    for r in runs:
+        plot = r.get("plot") or parse_plot(r.get("plot_name") or "")
+        if not plot:
+            skipped.append(f"#{r['n']} '{r.get('plot_name') or 'unnamed'}' (no plot)")
+            continue
+        csv_path = out_dir / r["csv_file"]
+        if not csv_path.exists():
+            skipped.append(f"#{r['n']} '{r.get('plot_name')}' (csv missing)")
+            continue
+        todo.append((r, plot, csv_path, (r.get("weight") or "").rstrip("g")))
+    if not todo:
+        return _alert("No runs with a Plot to append — scan the tag or use "
+                      "Manual Entry's Set Sample Information before each run. "
+                      "Skipped: " + "; ".join(skipped), "warning")
+
+    try:
+        blob = team_manager.get_file(file_path)
+        if not blob:
+            return _alert(f"Could not download {file_path}.", "danger")
+        appended, failed = [], []
+        for r, plot, csv_path, weight in todo:
+            try:
+                row = compute_summary(csv_path, mode=r.get("mode") or "",
+                                      plot_weight=weight, plot=plot)
+                blob = merge_summary_into_workbook(blob, row)
+                appended.append(f"{plot} ({r.get('mode')})")
+            except ValueError as e:
+                failed.append(str(e))
+        if not appended:
+            return _alert("Nothing appended. " + " | ".join(failed), "danger")
+        team_manager.upload_file(blob, file_path, mode="overwrite")
+    except Exception as e:  # noqa: BLE001
+        return _alert(f"Append failed: {e}", "danger")
+
+    parts = [f"Appended {len(appended)} run(s) to {file_path}: "
+             + ", ".join(appended)]
+    if failed:
+        parts.append("Failed: " + " | ".join(failed))
+    if skipped:
+        parts.append("Skipped: " + "; ".join(skipped))
+    color = "success" if not failed and not skipped else "warning"
+    return _alert(" — ".join(parts), color)
+
+
+# ── Local: download the whole session summarized (one row per plot) ──────────
+@app.callback(
+    Output("local-download", "data", allow_duplicate=True),
+    Output("local-result", "children", allow_duplicate=True),
+    Input("btn-summary-download", "n_clicks"),
+    prevent_initial_call=True,
+)
+def summary_download(_n):
+    snap = CONTROLLER.snapshot()
+    df = session_summary_table(snap["session"],
+                               CONTROLLER.cfg.get("output_dir", "./output"))
+    if df.empty:
+        return dash.no_update, dbc.Alert(
+            "No completed runs to summarize yet.", color="warning",
+            className="small mb-0")
+    name = f"{CONTROLLER.session_path.stem}_summary.csv"
+    return (dcc.send_string(df.to_csv(index=False), filename=name),
+            dbc.Alert(f"Downloading {name} — {len(df)} plot(s) summarized",
+                      color="success", dismissable=True, className="small mb-0"))
+
+
+# ── Dropbox: upload the whole session summarized (one row per plot) ──────────
+@app.callback(
+    Output("dropbox-result", "children", allow_duplicate=True),
+    Input("btn-dropbox-summary", "n_clicks"),
+    State("dropbox-folder", "value"),
+    prevent_initial_call=True,
+)
+def dropbox_summary(_n, folder):
+    if team_manager is None:
+        return dbc.Alert("Dropbox client not configured (check .env).",
+                         color="danger", className="small mb-0")
+    snap = CONTROLLER.snapshot()
+    df = session_summary_table(snap["session"],
+                               CONTROLLER.cfg.get("output_dir", "./output"))
+    if df.empty:
+        return dbc.Alert("No completed runs to summarize yet.",
+                         color="warning", className="small mb-0")
+    folder = (folder or "").strip()
+    if folder == DROPBOX_DEFAULT_DEST:
+        folder = DROPBOX_ROOT
+    name = f"{CONTROLLER.session_path.stem}_summary.csv"
+    dest = f"{folder.rstrip('/')}/{name}"
+    try:
+        # overwrite: re-uploading the same session updates its summary file
+        meta = team_manager.upload_file(df.to_csv(index=False).encode(),
+                                        dest, mode="overwrite")
+        return dbc.Alert(
+            f"Uploaded {len(df)} plot(s) to "
+            f"{getattr(meta, 'path_display', dest)}",
+            color="success", dismissable=True, className="small mb-0")
+    except Exception as e:  # noqa: BLE001
+        return dbc.Alert(f"Upload failed: {e}", color="danger",
+                         dismissable=True, className="small mb-0")
+
+
 # ── Dropbox: download (upload latest recording CSV to chosen folder) ─────────
 @app.callback(
     Output("dropbox-result", "children"),
     Input("btn-dropbox-download", "n_clicks"),
     State("dropbox-folder", "value"),
     State("dropbox-filename", "value"),
+    State("session-table", "selected_rows"),
     prevent_initial_call=True,
 )
-def dropbox_download(_n, folder, filename):
+def dropbox_download(_n, folder, filename, selected_rows):
     if team_manager is None:
         return dbc.Alert("Dropbox client not configured (check .env).",
                          color="danger", className="small mb-0")
-    last = CONTROLLER.snapshot()["last_csv"]
-    if not last or not Path(last).exists():
-        return dbc.Alert("No recording available to upload yet.",
-                         color="warning", className="small mb-0")
-    name = (filename or "").strip() or Path(last).name
+    csv_path, sample = _resolve_export_run(selected_rows)
+    if csv_path is None:
+        return dbc.Alert("No recording available to upload for the selected "
+                         "run yet.", color="warning", className="small mb-0")
+    # Blank -> the run's sample name (as the placeholder says), then the
+    # CSV's own name as a last resort.
+    name = (filename or "").strip() or sample or csv_path.name
     if not name.lower().endswith(".csv"):
         name += ".csv"
-    dest = f"{(folder or DROPBOX_ROOT).rstrip('/')}/{name}"
+    # The default destination shown in the box is a display label for the
+    # team-space root — map it to the real root path ("") for the API.
+    folder = (folder or "").strip()
+    if folder == DROPBOX_DEFAULT_DEST:
+        folder = DROPBOX_ROOT
+    dest = f"{folder.rstrip('/')}/{name}"
     try:
-        data = Path(last).read_bytes()
+        data = csv_path.read_bytes()
         meta = team_manager.upload_file(data, dest, mode="add")
         return dbc.Alert(f"Uploaded to {getattr(meta, 'path_display', dest)}",
                          color="success", dismissable=True, className="small mb-0")
@@ -1348,21 +1901,20 @@ def dropbox_download(_n, folder, filename):
     Output("local-result", "children"),
     Input("btn-local-download", "n_clicks"),
     State("local-filename", "value"),
+    State("session-table", "selected_rows"),
     prevent_initial_call=True,
 )
-def local_download(_n, filename):
-    snap = CONTROLLER.snapshot()
-    last = snap["last_csv"]
-    if not last or not Path(last).exists():
-        return dash.no_update, dbc.Alert("No recording available to download yet.",
-                                         color="warning", className="small mb-0")
-    # Blank file name -> use the run's sample name; fall back to the CSV's name.
-    name = ((filename or "").strip()
-            or (snap.get("last_sample") or "").strip()
-            or Path(last).name)
+def local_download(_n, filename, selected_rows):
+    csv_path, sample = _resolve_export_run(selected_rows)
+    if csv_path is None:
+        return dash.no_update, dbc.Alert(
+            "No recording available to download for the selected run yet.",
+            color="warning", className="small mb-0")
+    # Blank file name -> the run's sample name; fall back to the CSV's name.
+    name = (filename or "").strip() or sample or csv_path.name
     if not name.lower().endswith(".csv"):
         name += ".csv"
-    return (dcc.send_file(last, filename=name),
+    return (dcc.send_file(str(csv_path), filename=name),
             dbc.Alert(f"Downloading {name}", color="success",
                       dismissable=True, className="small mb-0"))
 

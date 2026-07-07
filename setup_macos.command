@@ -31,9 +31,22 @@ echo "==> micromamba $("$MM" --version)"
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 ENV_PREFIX="$PWD/envs/grading"
 
+# If this folder lives inside Dropbox, keep Dropbox away from the env:
+# syncing offloads/deletes binaries out of it and breaks the app.
+mkdir -p envs
+xattr -w com.dropbox.ignored 1 envs 2>/dev/null || true
+xattr -w com.dropbox.ignored 1 .micromamba 2>/dev/null || true
+
 if [ -d "$ENV_PREFIX" ]; then
   echo "==> Existing environment found — rebuilding it."
   rm -rf "$ENV_PREFIX"
+  if [ -d "$ENV_PREFIX" ]; then
+    echo "ERROR: could not fully remove the old environment at:" >&2
+    echo "  $ENV_PREFIX" >&2
+    echo "Close the PBG Grading app (and any terminal running it), pause" >&2
+    echo "Dropbox syncing, delete the envs folder by hand, then re-run." >&2
+    exit 1
+  fi
 fi
 
 echo "==> Building environment from environment.yml (several minutes on first run)…"

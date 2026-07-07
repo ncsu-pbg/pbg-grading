@@ -26,6 +26,15 @@ if not exist "%HERE%environment.yml" (
   goto :fail
 )
 
+rem --- 0. Keep Dropbox away from the environment ----------------------------
+rem If this folder lives inside Dropbox, syncing offloads/deletes binaries out
+rem of the env and breaks the app. Set Dropbox's official ignore marker on the
+rem env folders (inline powershell command, not a script file - not blocked by
+rem AllSigned policy; best-effort either way).
+if not exist "%HERE%envs" mkdir "%HERE%envs"
+if not exist "%HERE%.micromamba" mkdir "%HERE%.micromamba"
+powershell -NoProfile -Command "Set-Content -Path '%HERE%envs' -Stream com.dropbox.ignored -Value 1; Set-Content -Path '%HERE%.micromamba' -Stream com.dropbox.ignored -Value 1" >nul 2>nul
+
 rem --- 1. Download micromamba (single .exe, no admin) -----------------------
 if exist "%MM%" goto :have_mm
 echo ==^> Downloading micromamba ^(win-64^)...
@@ -48,6 +57,21 @@ rem --- 2. (Re)build the environment -----------------------------------------
 if exist "%ENVPREFIX%" (
   echo ==^> Existing environment found - rebuilding it.
   rmdir /s /q "%ENVPREFIX%"
+)
+rem Locked files (app still running, OneDrive/Dropbox sync) can survive the
+rem delete; retry once, then stop with a clear message instead of letting
+rem micromamba abort with "Non-conda folder exists at prefix".
+if exist "%ENVPREFIX%" (
+  timeout /t 2 /nobreak >nul
+  rmdir /s /q "%ENVPREFIX%" 2>nul
+)
+if exist "%ENVPREFIX%" (
+  echo ERROR: could not fully remove the old environment at:
+  echo   %ENVPREFIX%
+  echo Close the PBG Grading app ^(check Task Manager for python.exe^),
+  echo pause OneDrive/Dropbox syncing, delete the envs folder by hand,
+  echo then run this setup again.
+  goto :fail
 )
 echo ==^> Building environment from environment.yml ^(several minutes on first run^)...
 "%MM%" create -y -p "%ENVPREFIX%" -f "%HERE%environment.yml"
