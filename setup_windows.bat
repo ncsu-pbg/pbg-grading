@@ -26,6 +26,16 @@ if not exist "%HERE%environment.yml" (
   goto :fail
 )
 
+rem Heads-up when the install lives inside a synced folder: sync clients hold
+rem file locks that can break env deletes/rebuilds. Stations run best from a
+rem plain local folder (e.g. C:\PBG Grading).
+echo "%HERE%" | findstr /i "Dropbox OneDrive" >nul && (
+  echo NOTE: this folder appears to be inside Dropbox/OneDrive. If setup
+  echo fails with "file in use" errors, pause syncing and run setup again.
+  echo Consider installing stations outside synced folders.
+  echo.
+)
+
 rem --- 0. Keep Dropbox away from the environment ----------------------------
 rem If this folder lives inside Dropbox, syncing offloads/deletes binaries out
 rem of the env and breaks the app. Set Dropbox's official ignore marker on the
@@ -67,7 +77,7 @@ if exist "%ENVPREFIX%" (
 )
 if exist "%ENVPREFIX%" (
   echo ERROR: could not fully remove the old environment at:
-  echo   %ENVPREFIX%
+  echo   "%ENVPREFIX%"
   echo Close the PBG Grading app ^(check Task Manager for python.exe^),
   echo pause OneDrive/Dropbox syncing, delete the envs folder by hand,
   echo then run this setup again.
