@@ -89,7 +89,7 @@ if errorlevel 1 ( echo ERROR: environment build failed. & goto :fail )
 
 rem --- 3. Verify imports ----------------------------------------------------
 echo ==^> Verifying imports...
-"%ENVPREFIX%\python.exe" -c "import dash, plotly, numpy, pandas, scipy, cv2, yaml, dotenv, requests, dropbox, depthai, PyQt6.QtCore; import sys; print('  python', sys.version.split()[0]); print('  depthai', depthai.__version__); print('  opencv', cv2.__version__)"
+"%ENVPREFIX%\python.exe" -c "import dash, plotly, numpy, pandas, scipy, yaml, dotenv, requests, dropbox; import sys; print('  python', sys.version.split()[0]); print('  dash', dash.__version__)"
 if errorlevel 1 ( echo ERROR: import verification failed. & goto :fail )
 
 rem --- 4. Desktop shortcut (best-effort) ------------------------------------

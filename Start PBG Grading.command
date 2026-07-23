@@ -14,11 +14,7 @@ if [ ! -x ".micromamba/micromamba" ] || [ ! -d "envs/grading" ]; then
   exit 1
 fi
 
-# Activate the env and run python DIRECTLY (not via `micromamba run`).
-# This makes the app a normal child of this shell, so the PyQt6 calibration
-# dialogs it spawns open in the foreground GUI session — exactly as they do
-# when the app is run natively. `micromamba run` wraps the app in a way that
-# left those spawned dialog windows stuck behind the browser on macOS.
+# Activate the env and run python directly.
 export MAMBA_ROOT_PREFIX="$PWD/.micromamba"
 eval "$(./.micromamba/micromamba shell hook --shell bash)"
 micromamba activate "$PWD/envs/grading"

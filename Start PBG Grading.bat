@@ -12,9 +12,7 @@ set "HERE=%~dp0"
 if not exist "%HERE%.micromamba\micromamba.exe" goto :nosetup
 if not exist "%HERE%envs\grading" goto :nosetup
 
-rem Activate the env by PATH and run python.exe DIRECTLY (not via
-rem `micromamba run`). This makes the app a normal child process so the PyQt6
-rem calibration dialogs it spawns open in the foreground, and it puts the
+rem Activate the env by PATH and run python.exe directly, putting the
 rem env's library dirs on PATH for correct DLL resolution.
 set "ENV=%HERE%envs\grading"
 set "CONDA_PREFIX=%ENV%"
