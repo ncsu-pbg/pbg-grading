@@ -288,6 +288,14 @@ def merge_summary_into_workbook(existing_bytes: bytes, summary: Dict[str, object
             # values so far); pandas 3 raises rather than upcast on a float
             # write, so upcast explicitly.
             data[col] = data[col].astype("float64")
+        elif (isinstance(val, str)
+                and not (data[col].dtype == object
+                         or pd.api.types.is_string_dtype(data[col].dtype))):
+            # Same round-trip problem for text: an all-empty column (e.g.
+            # 'Seed Color [hex]' created by a pod-only append) reads back
+            # from Excel as float64 NaNs, and pandas 3 raises on writing a
+            # string into it. Upcast to object first.
+            data[col] = data[col].astype("object")
         data.loc[mask, col] = val
         updated.append(col)
 

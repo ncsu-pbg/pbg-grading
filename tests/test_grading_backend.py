@@ -368,3 +368,18 @@ def test_hook_deferred_until_weight_answered(fake_cam, tmp_path):
     assert _wait(lambda: seen)
     assert seen[0]["weight"] == "205"
     assert seen[0]["meta"]["trial_path"] == "/t.xlsx"
+
+
+def test_session_naming(tmp_path):
+    s1 = SessionLog(tmp_path, "pod")
+    s1.add_run("Pod", "2026_T_NC_X_101", "101", "150", 42, "01:00", "a.csv")
+    s1.set_name("LEW MET day 1")
+    assert s1.snapshot()["name"] == "LEW MET day 1"
+
+    # Name shows in the saved-session labels and survives a reload.
+    labels = [x["label"] for x in s1.list_sessions()]
+    assert any(lbl.startswith("LEW MET day 1 — ") for lbl in labels)
+    s2 = SessionLog(tmp_path, "pod")
+    n, err = s2.load_session(str(s1.session_path))
+    assert err is None and n == 1
+    assert s2.snapshot()["name"] == "LEW MET day 1"

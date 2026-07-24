@@ -48,6 +48,7 @@ import os
 import threading
 import time
 import webbrowser
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -63,7 +64,7 @@ load_dotenv()
 
 from camera_client import CameraClientError
 from dropbox_team_client import TeamDropboxClientManager
-from grading_backend import build_controllers
+from grading_backend import build_controllers, safe_filename
 from summary import (compute_summary, merge_summary_into_workbook, parse_plot,
                      parse_qr, qr_to_sample_name, session_summary_table)
 
@@ -219,15 +220,19 @@ def verify_before_start(mode_key: str, name: str, plot: str):
     fname = Path(trial_path).name
     if not st["exists"]:
         return None, f"Plot {plot} is not in {fname} — check the tag."
+    # If a re-grade IS intentional, the escape hatch is: run the sample in
+    # Test Mode with the same numeric plot, then Admin → Append All Session
+    # Runs to the trial file (new values replace old).
+    regrade = (f"If re-grading it is intentional: run it in Test Mode with "
+               f"plot {plot}, then Admin → Append All Session Runs.")
     if mode_key == "pod":
         if st["has_pod"]:
             return None, (f"Plot {plot} already has POD data in {fname} — "
-                          f"grading it again would overwrite. (Admin tools "
-                          f"can fix the trial file if this is intentional.)")
+                          f"grading it again would overwrite. {regrade}")
     else:
         if st["has_seed"]:
             return None, (f"Plot {plot} already has SEED data in {fname} — "
-                          f"grading it again would overwrite.")
+                          f"grading it again would overwrite. {regrade}")
         if not st["has_pod"]:
             return None, (f"Plot {plot} has NO pod data in {fname} yet — "
                           f"grade the pods FIRST. Shelling without pod data "
@@ -392,9 +397,9 @@ def build_camera_panel(mode: str) -> dbc.Col:
 
                 html.Div(dbc.Checkbox(
                     id=f"saveframes-{mode}", value=False,
-                    label="Save frames (stored on the camera)"),
-                    id=f"saveframes-wrap-{mode}",
-                    style={"display": "none"}, className="mb-2"),
+                    label="Save frames for this run (stored on the camera "
+                          "— fetch via Admin → Stored Runs…)"),
+                    id=f"saveframes-wrap-{mode}", className="mb-2"),
 
                 dbc.Row([
                     dbc.Col(dbc.Button([html.I(className="bi bi-play-fill me-1"),
@@ -662,10 +667,22 @@ app.layout = dbc.Container([
         ), width="auto"),
         dbc.Col(html.Div(id="mode-hint", className="small text-muted pt-1"),
                 width="auto"),
+        # Session name — labels BOTH cameras' current sessions (shows in
+        # the Previous sessions… lists and the summary downloads).
+        dbc.Col(dbc.InputGroup([
+            dbc.InputGroupText("Session", style={"fontSize": "12px"}),
+            dbc.Input(id="session-name", size="sm", debounce=True,
+                      placeholder="name this session…",
+                      style={"maxWidth": "220px"}),
+            dbc.Button("Set", id="btn-session-name", size="sm",
+                       style=BTN_DARK),
+        ], size="sm"), width="auto", className="ms-auto"),
+        dbc.Col(html.Div(id="session-name-result", className="small",
+                         style={"minHeight": "1em"}), width="auto"),
         dbc.Col(dbc.Button([html.I(className="bi bi-gear me-1"), "Admin"],
                            id="admin-btn", size="sm", outline=True,
                            color="secondary"),
-                width="auto", className="ms-auto"),
+                width="auto"),
     ], className="mb-3 align-items-center"),
 
     # ── Camera panels ─────────────────────────────────────────────────────────
@@ -675,28 +692,50 @@ app.layout = dbc.Container([
     html.Div(dbc.Row(dbc.Col(
         _card("Test Mode — Download Data", [
             html.Div("Test runs are not appended anywhere — download them "
-                     "here. Select a history row for that run's raw CSV; "
-                     "no selection = the latest run.",
+                     "here. 'Run' buttons use the selected history row "
+                     "(no selection = the latest run); 'Session' buttons "
+                     "cover every run in both cameras' current sessions.",
                      className="text-muted small mb-2"),
             dbc.Row([
                 dbc.Col([
-                    html.Div("File Name", style=LABEL_STYLE),
+                    html.Div("File Name (run downloads)", style=LABEL_STYLE),
                     dbc.Input(id="local-filename", size="sm",
                               placeholder="Default: the CSV's own name"),
-                ], md=7),
-                dbc.Col(
-                    dbc.Button([html.I(className="bi bi-download me-1"),
-                                "Download Run CSV"],
-                               id="btn-local-download",
-                               style=BTN_DARK, className="w-100", size="sm"),
-                    md=5, className="d-flex align-items-end"),
-            ], className="g-2 mb-1 align-items-end"),
-            dbc.Button([html.I(className="bi bi-table me-1"),
-                        "Download Session Summary"],
-                       id="btn-summary-download", style=BTN_DARK,
-                       className="w-100 mt-2", size="sm",
-                       title="One summarized row per plot/sample for every "
-                             "run in both sessions."),
+                ], md=12),
+            ], className="g-2 mb-2 align-items-end"),
+            dbc.Row([
+                dbc.Col(dbc.Button([html.I(className="bi bi-download me-1"),
+                                    "Run — Raw CSV"],
+                                   id="btn-local-download",
+                                   style=BTN_DARK, className="w-100",
+                                   size="sm",
+                                   title="Every tracked item of the selected/"
+                                         "latest run (mm + colour columns)."),
+                        md=6, className="mb-2"),
+                dbc.Col(dbc.Button([html.I(className="bi bi-file-text me-1"),
+                                    "Run — Summary"],
+                                   id="btn-run-summary-download",
+                                   style=BTN_DARK, className="w-100",
+                                   size="sm",
+                                   title="One summarized row for the "
+                                         "selected/latest run."),
+                        md=6, className="mb-2"),
+                dbc.Col(dbc.Button([html.I(className="bi bi-table me-1"),
+                                    "Session — All Summaries"],
+                                   id="btn-summary-download", style=BTN_DARK,
+                                   className="w-100", size="sm",
+                                   title="One summarized row per plot/sample "
+                                         "for every run in both sessions."),
+                        md=6, className="mb-2"),
+                dbc.Col(dbc.Button([html.I(className="bi bi-file-zip me-1"),
+                                    "Session — All Raw CSVs (zip)"],
+                                   id="btn-session-raw-download",
+                                   style=BTN_DARK, className="w-100",
+                                   size="sm",
+                                   title="Zip of every run's raw CSV from "
+                                         "both cameras' current sessions."),
+                        md=6, className="mb-2"),
+            ], className="g-2"),
             dcc.Download(id="local-download"),
             html.Div(id="local-result", className="mt-2"),
         ]), lg=6)), id="test-download-wrap", style={"display": "none"}),
@@ -881,18 +920,43 @@ def admin_control(_b, _l, _s, _o, user, pw, authed, sec_open):
 
 @app.callback(
     Output("test-download-wrap", "style"),
-    Output(f"saveframes-wrap-{MODES[0]}", "style"),
-    Output(f"saveframes-wrap-{MODES[-1]}", "style"),
     Output("mode-hint", "children"),
     Input("ui-mode", "value"),
 )
 def mode_visibility(ui_mode):
     if ui_mode == "test":
-        return ({}, {}, {},
+        return ({},
                 "Test Mode — any sample name, nothing is appended to trials.")
-    hide = {"display": "none"}
-    return (hide, hide, hide,
+    return ({"display": "none"},
             "Scan the bag's QR tag — the trial file is found automatically.")
+
+
+# ── Session naming (labels BOTH cameras' current sessions) ───────────────────
+@app.callback(
+    Output("session-name-result", "children"),
+    Output("session-name", "value"),
+    Input("btn-session-name", "n_clicks"),
+    Input("session-name", "n_submit"),
+    Input("poll", "n_intervals"),
+    State("session-name", "value"),
+    prevent_initial_call=True,
+)
+def set_session_name(_n, _s, poll_n, name):
+    trig = dash.ctx.triggered_id
+    if trig == "poll":
+        # Once, shortly after page load: show the current name (e.g. after
+        # a browser refresh or a session load).
+        if poll_n and poll_n <= 2:
+            current = SESSIONS[MODES[0]].snapshot()["name"]
+            return dash.no_update, (current or dash.no_update)
+        raise dash.exceptions.PreventUpdate
+    name = str(name or "").strip()
+    for m in MODES:
+        SESSIONS[m].set_name(name)
+    if not name:
+        return html.Span("Session name cleared.",
+                         className="text-muted"), dash.no_update
+    return html.Span("✓ named", className="text-success"), dash.no_update
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -997,7 +1061,7 @@ def register_panel_callbacks(mode: str) -> None:
         trial_path, err = verify_before_start(_mode, name, plot)
         if err:
             return _err(err)
-        err = ctlr.start(name, plot, weight, save_frames=False,
+        err = ctlr.start(name, plot, weight, save_frames=bool(save_frames),
                          meta={"trial_path": trial_path})
         if err:
             return _err(err)
@@ -1016,6 +1080,7 @@ def register_panel_callbacks(mode: str) -> None:
         Output(f"name-{mode}", "value", allow_duplicate=True),
         Output(f"plot-{mode}", "value", allow_duplicate=True),
         Output(f"weight-{mode}", "value"),
+        Output(f"saveframes-{mode}", "value"),
         Output(f"qr-result-{mode}", "children", allow_duplicate=True),
         Input(f"stop-{mode}", "n_clicks"),
         prevent_initial_call=True,
@@ -1024,11 +1089,13 @@ def register_panel_callbacks(mode: str) -> None:
         err = CONTROLLERS[_mode].stop()
         if err:
             return (dbc.Alert(err, color="warning", dismissable=True,
-                              className="small mb-0"),) + (dash.no_update,) * 4
+                              className="small mb-0"),) + (dash.no_update,) * 5
+        # Clear every per-sample input — including frame saving, so one
+        # special run can't silently save frames for the whole day.
         return (dbc.Alert("Stopping — results land in the session table.",
                           color="warning", dismissable=True, duration=4000,
                           className="small mb-0"),
-                "", "", None, "")
+                "", "", None, False, "")
 
     # ── QR scan → sample name + plot (+ trial verification in Grading) ───────
     @app.callback(
@@ -1280,6 +1347,33 @@ def _resolve_export_run(selections: dict):
     return None, None
 
 
+def _resolve_export_row(selections: dict) -> Optional[dict]:
+    """The session-row dict for the selected history row in either table,
+    else the most recent completed run across both cameras."""
+    for m, selected_rows in selections.items():
+        if not selected_rows:
+            continue
+        runs = SESSIONS[m].snapshot()["session"]
+        i = selected_rows[0]
+        return runs[i] if 0 <= i < len(runs) else None
+    latest = max((SESSIONS[m].snapshot() for m in MODES),
+                 key=lambda s: s["last_csv_time"], default=None)
+    if not latest or not latest["last_csv"]:
+        return None
+    csv_name = Path(latest["last_csv"]).name
+    for m in MODES:
+        for r in reversed(SESSIONS[m].snapshot()["session"]):
+            if r.get("csv_file") == csv_name:
+                return r
+    return None
+
+
+def _session_file_prefix() -> str:
+    """Session name (sanitised) for download filenames, else 'grading'."""
+    name = SESSIONS[MODES[0]].snapshot()["name"]
+    return safe_filename(name) if name else "grading"
+
+
 # ── Local downloads (Test Mode card) ─────────────────────────────────────────
 @app.callback(
     Output("local-download", "data"),
@@ -1316,9 +1410,60 @@ def summary_download(_n):
         return dash.no_update, dbc.Alert(
             "No completed runs to summarize yet.", color="warning",
             className="small mb-0")
-    name = f"grading_summary_{time.strftime('%Y%m%d')}.csv"
+    name = f"{_session_file_prefix()}_summary_{time.strftime('%Y%m%d')}.csv"
     return (dcc.send_string(df.to_csv(index=False), filename=name),
             dbc.Alert(f"Downloading {name} — {len(df)} plot(s) summarized",
+                      color="success", dismissable=True,
+                      className="small mb-0"))
+
+
+@app.callback(
+    Output("local-download", "data", allow_duplicate=True),
+    Output("local-result", "children", allow_duplicate=True),
+    Input("btn-run-summary-download", "n_clicks"),
+    State(f"session-table-{MODES[0]}", "selected_rows"),
+    State(f"session-table-{MODES[-1]}", "selected_rows"),
+    prevent_initial_call=True,
+)
+def run_summary_download(_n, sel_a, sel_b):
+    row = _resolve_export_row({MODES[0]: sel_a, MODES[-1]: sel_b})
+    if not row or not row.get("csv_file") or row["csv_file"] == "(none)":
+        return dash.no_update, dbc.Alert(
+            "No recording available for the selected run yet.",
+            color="warning", className="small mb-0")
+    df = session_summary_table([row], OUTPUT_DIR)
+    if df.empty:
+        return dash.no_update, dbc.Alert(
+            "Could not summarize that run (CSV missing?).",
+            color="warning", className="small mb-0")
+    name = f"summary_{Path(row['csv_file']).stem}.csv"
+    return (dcc.send_string(df.to_csv(index=False), filename=name),
+            dbc.Alert(f"Downloading {name}", color="success",
+                      dismissable=True, className="small mb-0"))
+
+
+@app.callback(
+    Output("local-download", "data", allow_duplicate=True),
+    Output("local-result", "children", allow_duplicate=True),
+    Input("btn-session-raw-download", "n_clicks"),
+    prevent_initial_call=True,
+)
+def session_raw_download(_n):
+    buf = io.BytesIO()
+    n = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for r in combined_runs():
+            csvf = r.get("csv_file")
+            if csvf and csvf != "(none)" and (OUTPUT_DIR / csvf).exists():
+                z.write(OUTPUT_DIR / csvf, arcname=csvf)
+                n += 1
+    if n == 0:
+        return dash.no_update, dbc.Alert(
+            "No run CSVs in the current sessions yet.", color="warning",
+            className="small mb-0")
+    name = f"{_session_file_prefix()}_raw_{time.strftime('%Y%m%d')}.zip"
+    return (dcc.send_bytes(buf.getvalue(), filename=name),
+            dbc.Alert(f"Downloading {name} — {n} run CSV(s)",
                       color="success", dismissable=True,
                       className="small mb-0"))
 

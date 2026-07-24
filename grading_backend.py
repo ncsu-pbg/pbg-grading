@@ -67,9 +67,15 @@ class SessionLog:
             self.sessions_dir /
             f"session_{mode}_{time.strftime('%Y%m%d_%H%M%S')}.json")
         self.runs: List[dict] = []
+        self.name: str = ""              # operator-given session name
         self.last_csv_path: Optional[Path] = None
         self.last_csv_time: float = 0.0
         self.last_plot: str = ""
+
+    def set_name(self, name: str) -> None:
+        with self._lock:
+            self.name = str(name or "").strip()
+        self._persist()
 
     def add_run(self, mode_label: str, plot_name: str, plot: str,
                 weight: str, count: int, elapsed: str, csv_file: str,
@@ -140,7 +146,7 @@ class SessionLog:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {"updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-                       "runs": runs}
+                       "name": self.name, "runs": runs}
             path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         except Exception as e:  # noqa: BLE001 — never let IO kill the run flow
             print(f"WARNING: could not save session file: {e}")
@@ -156,8 +162,10 @@ class SessionLog:
                 ts = time.strftime(
                     "%b %d %Y, %H:%M",
                     time.strptime(p.stem, f"session_{self.mode}_%Y%m%d_%H%M%S"))
+                name = (data.get("name") or "").strip()
+                label = f"{name} — {ts}" if name else ts
                 out.append({"path": str(p), "n_runs": len(runs),
-                            "label": f"{ts} — {len(runs)} run(s)"})
+                            "label": f"{label} — {len(runs)} run(s)"})
             except Exception:  # noqa: BLE001 — skip unreadable files
                 continue
         return out
@@ -178,6 +186,7 @@ class SessionLog:
             return 0, f"Could not read session: {e}"
         with self._lock:
             self.runs = runs
+            self.name = (data.get("name") or "").strip()
             self.session_path = Path(path)   # new runs continue in this file
         return len(runs), None
 
@@ -185,6 +194,7 @@ class SessionLog:
         with self._lock:
             return {
                 "session": list(self.runs),
+                "name": self.name,
                 "last_csv": str(self.last_csv_path) if self.last_csv_path else "",
                 "last_csv_time": self.last_csv_time,
                 "last_plot": self.last_plot,
