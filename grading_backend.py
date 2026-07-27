@@ -257,6 +257,12 @@ class CameraController:
         self._poll_thread: Optional[threading.Thread] = None
         self._stop_polling = threading.Event()
 
+        # Background stored-run downloads. Serialized per camera (one
+        # worker) — a 1 GB tarball fetch shouldn't compete with a second
+        # one for the camera's CPU/network. Progress is polled by the UI.
+        self.downloads: dict = {}          # name -> state dict
+        self._dl_thread: Optional[threading.Thread] = None
+
     # ── polling ──────────────────────────────────────────────────────────────
     def start_polling(self, interval_s: float = 1.0) -> None:
         if self._poll_thread is not None:
@@ -609,6 +615,59 @@ class CameraController:
         dest.mkdir(parents=True, exist_ok=True)
         return self.client.download_run(name, dest)
 
+    def download_run_async(self, name: str,
+                           total_bytes: int = 0) -> Optional[str]:
+        """Queue a stored-run download on the per-camera worker thread.
+        Returns an error string only when that run is already in flight.
+        Progress lands in snapshot()['downloads'] for the UI to render."""
+        with self._lock:
+            d = self.downloads.get(name)
+            if d and d["state"] in ("queued", "downloading"):
+                return f"{name} is already downloading."
+            self.downloads[name] = {"name": name, "state": "queued",
+                                    "done": 0, "total": int(total_bytes or 0),
+                                    "dest": "", "error": ""}
+            if self._dl_thread is None or not self._dl_thread.is_alive():
+                self._dl_thread = threading.Thread(
+                    target=self._download_worker, daemon=True,
+                    name=f"dl-{self.mode}")
+                self._dl_thread.start()
+        return None
+
+    def _download_worker(self) -> None:
+        while True:
+            with self._lock:
+                item = next((d for d in self.downloads.values()
+                             if d["state"] == "queued"), None)
+                if item is None:
+                    return
+                item["state"] = "downloading"
+            name = item["name"]
+            self._log(f"Downloading {name}…")
+
+            def _cb(done: int, _item=item):
+                _item["done"] = done          # GIL-safe int store
+
+            try:
+                dest_dir = self.runs_download_dir()
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = self.client.download_run(name, dest_dir,
+                                                progress_cb=_cb)
+                with self._lock:
+                    item["state"] = "done"
+                    item["dest"] = str(dest)
+                self._log(f"✓ Downloaded {name} → {dest}")
+            except CameraClientError as e:
+                with self._lock:
+                    item["state"] = "failed"
+                    item["error"] = str(e)
+                self._log(f"ERROR: download of {name} failed: {e}")
+
+    def clear_finished_downloads(self) -> None:
+        with self._lock:
+            self.downloads = {k: v for k, v in self.downloads.items()
+                              if v["state"] in ("queued", "downloading")}
+
     def delete_run(self, name: str) -> None:
         self.client.delete_run(name)
 
@@ -634,6 +693,7 @@ class CameraController:
                 "lifecycle_busy": self.lifecycle_busy,
                 "pending_weight": (dict(self.pending_weight)
                                    if self.pending_weight else None),
+                "downloads": [dict(v) for v in self.downloads.values()],
                 "log": "\n".join(self.logs),
                 "error": self.last_error,
             }

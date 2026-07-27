@@ -76,6 +76,14 @@ class FakePodCounter:
                     })
                 if self.path == "/runs":
                     return self._json(fake.stored_runs)
+                if self.path.endswith(".tar.gz"):
+                    body = b"x" * 300_000
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/gzip")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 return self._json({"error": "not found"}, 404)
 
             def do_POST(self):
@@ -383,3 +391,19 @@ def test_session_naming(tmp_path):
     n, err = s2.load_session(str(s1.session_path))
     assert err is None and n == 1
     assert s2.snapshot()["name"] == "LEW MET day 1"
+
+
+def test_async_download_manager(controller, fake_cam, tmp_path):
+    assert controller.download_run_async("old_run_1",
+                                         total_bytes=300_000) is None
+    # Duplicate queueing of an in-flight run is refused.
+    dup = controller.download_run_async("old_run_1")
+    assert dup is None or "already" in dup
+    assert _wait(lambda: any(d["state"] == "done"
+                             for d in controller.snapshot()["downloads"]))
+    d = controller.snapshot()["downloads"][0]
+    assert d["done"] == 300_000
+    assert (tmp_path / "camera_runs" / "pod" / "old_run_1.tar.gz").exists()
+    assert "Downloaded old_run_1" in controller.snapshot()["log"]
+    controller.clear_finished_downloads()
+    assert controller.snapshot()["downloads"] == []

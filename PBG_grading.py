@@ -456,13 +456,18 @@ def build_camera_panel(mode: str) -> dbc.Col:
 
         # Per-camera session history (separate pod/seed sessions).
         _card(f"{ctl.label} Session History", [
+            html.Div(id=f"session-current-{mode}",
+                     className="small fw-bold mb-1"),
+            html.Div("Select one or more rows to download those runs "
+                     "(Test Mode / Admin); none selected = the latest run.",
+                     className="text-muted mb-1", style={"fontSize": "11px"}),
             dash_table.DataTable(
                 id=f"session-table-{mode}",
                 columns=[{"name": c, "id": i} for c, i in [
                     ("#", "n"), ("Sample", "plot_name"), ("Plot", "plot"),
                     ("Weight", "weight"), ("Count", "count"),
                     ("Duration", "elapsed"), ("Appended", "appended")]],
-                data=[], row_selectable="single", selected_rows=[],
+                data=[], row_selectable="multi", selected_rows=[],
                 page_size=8,
                 style_table={"overflowX": "auto"},
                 style_cell={"fontSize": "11px", "padding": "5px",
@@ -501,9 +506,12 @@ def build_camera_panel(mode: str) -> dbc.Col:
             dbc.ModalBody([
                 html.Div("Runs live on the camera's /data partition. "
                          "Download fetches a .tar.gz (frames + CSV) into "
-                         f"output/camera_runs/{mode}/; Delete removes the "
-                         "run from the camera permanently.",
+                         f"output/camera_runs/{mode}/ in the background — "
+                         "progress shows below and you can close this "
+                         "window meanwhile. Delete removes the run from "
+                         "the camera permanently.",
                          className="text-muted small mb-2"),
+                html.Div(id=f"runs-progress-{mode}", className="mb-2"),
                 html.Div(id=f"runs-result-{mode}", className="small mb-2"),
                 html.Div(id=f"runs-list-{mode}",
                          style={"maxHeight": "380px", "overflowY": "auto"}),
@@ -974,6 +982,7 @@ def register_panel_callbacks(mode: str) -> None:
         Output(f"active-{mode}", "children"),
         Output(f"light-{mode}", "style"),
         Output(f"session-table-{mode}", "data"),
+        Output(f"session-current-{mode}", "children"),
         Output(f"start-{mode}", "disabled"),
         Output(f"stop-{mode}", "disabled"),
         Output(f"name-{mode}", "disabled"),
@@ -996,6 +1005,12 @@ def register_panel_callbacks(mode: str) -> None:
         admin_lines = [html.Div(
             f"{'online' if s['online'] else 'OFFLINE'} · state {s['state']} "
             f"· {s['fps']:.1f} fps")]
+        active_dl = [d for d in (s.get("downloads") or [])
+                     if d["state"] in ("queued", "downloading")]
+        if active_dl:
+            admin_lines.append(html.Div(
+                f"⬇ {len(active_dl)} download(s) in progress — see "
+                f"Stored Runs…"))
         if s["online"]:
             admin_lines.append(html.Div(
                 f"pod-counter v{s['app_version']} · staged "
@@ -1009,10 +1024,13 @@ def register_panel_callbacks(mode: str) -> None:
                     "config pushed — restart to apply", color="warning"))
 
         busy = running or stopping
+        sess = SESSIONS[_mode].snapshot()
+        sess_name = sess["name"] or "(unnamed — set a name at the top)"
+        current = f"Session: {sess_name} · {len(sess['session'])} run(s)"
         return (
             str(s["count"]), s["elapsed"], f"{s['fps']:.1f} fps",
             f"Active: {s['active']}", light,
-            SESSIONS[_mode].snapshot()["session"],
+            sess["session"], current,
             busy or not s["online"],          # start disabled
             (not running) or stopping,        # stop disabled
             busy, busy, busy, busy,           # inputs locked during a run
@@ -1233,6 +1251,41 @@ def register_panel_callbacks(mode: str) -> None:
         return (html.Span(f"✓ Loaded {n} run(s) — new runs continue in this "
                           "session.", className="text-success"), [])
 
+    # ── Stored-runs download progress (poll-driven, live) ────────────────────
+    @app.callback(
+        Output(f"runs-progress-{mode}", "children"),
+        Input("poll", "n_intervals"),
+    )
+    def runs_progress(_n, _mode=mode):
+        dls = CONTROLLERS[_mode].snapshot().get("downloads") or []
+        if not dls:
+            return []
+        items = []
+        for d in dls:
+            if d["state"] == "queued":
+                items.append(html.Div(f"{d['name']} — queued…",
+                                      className="small text-muted mb-1"))
+            elif d["state"] == "downloading":
+                mb = d["done"] / 1e6
+                if d["total"]:
+                    pct = min(99, int(d["done"] * 100 / d["total"]))
+                    label = (f"{d['name']} — {mb:,.0f} / "
+                             f"{d['total'] / 1e6:,.0f} MB ({pct}%)")
+                else:
+                    pct, label = 100, f"{d['name']} — {mb:,.0f} MB…"
+                items.append(html.Div([
+                    html.Div(label, className="small"),
+                    dbc.Progress(value=pct, striped=True, animated=True,
+                                 style={"height": "10px"}),
+                ], className="mb-2"))
+            elif d["state"] == "done":
+                items.append(html.Div(f"✓ {d['name']} → {d['dest']}",
+                                      className="small text-success mb-1"))
+            else:
+                items.append(html.Div(f"✗ {d['name']} — {d['error']}",
+                                      className="small text-danger mb-1"))
+        return items
+
     # ── Stored-runs modal (opened from Admin) ────────────────────────────────
     @app.callback(
         Output(f"runs-modal-{mode}", "is_open"),
@@ -1250,6 +1303,8 @@ def register_panel_callbacks(mode: str) -> None:
         if trig == f"runs-close-{_mode}":
             return False, [], ""
         if trig in (f"runs-open-{_mode}", f"runs-refresh-{_mode}"):
+            if trig == f"runs-refresh-{_mode}":
+                CONTROLLERS[_mode].clear_finished_downloads()
             return True, render_runs_list(_mode), ""
         if isinstance(trig, dict):
             if not dash.ctx.triggered[0]["value"]:
@@ -1257,13 +1312,19 @@ def register_panel_callbacks(mode: str) -> None:
             ctlr = CONTROLLERS[_mode]
             name = trig.get("name", "")
             if trig.get("type") == f"run-dl-{_mode}":
+                # Queue in the background — big tarballs take minutes and
+                # must not block this callback. Size (for the progress %)
+                # comes from the listing.
+                total = 0
                 try:
-                    dest = ctlr.download_run(name)
-                    msg = html.Span(f"✓ Downloaded to {dest}",
-                                    className="text-success")
-                except CameraClientError as e:
-                    msg = html.Span(f"Download failed: {e}",
-                                    className="text-danger")
+                    total = next((r.get("bytes", 0) for r in ctlr.list_runs()
+                                  if r.get("name") == name), 0)
+                except CameraClientError:
+                    pass
+                err = ctlr.download_run_async(name, total_bytes=total)
+                msg = (html.Span(err, className="text-warning") if err else
+                       html.Span(f"Download of {name} started — progress "
+                                 f"below.", className="text-success"))
                 return True, render_runs_list(_mode), msg
             if trig.get("type") == f"run-del-{_mode}":
                 try:
@@ -1305,57 +1366,21 @@ def poll_shared(_n):
     return "  |  ".join(parts)
 
 
-# ── Only one history row selected across both tables ─────────────────────────
-def _register_selection_exclusion(this_mode: str, other_mode: str) -> None:
-    @app.callback(
-        Output(f"session-table-{other_mode}", "selected_rows",
-               allow_duplicate=True),
-        Input(f"session-table-{this_mode}", "selected_rows"),
-        prevent_initial_call=True,
-    )
-    def clear_other(rows):
-        if not rows:
-            raise dash.exceptions.PreventUpdate
-        return []
-
-
-if len(MODES) == 2:
-    _register_selection_exclusion(MODES[0], MODES[1])
-    _register_selection_exclusion(MODES[1], MODES[0])
-
-
-def _resolve_export_run(selections: dict):
-    """(csv_path, plot) for the selected history row in either camera's
-    table, else the most recent completed run across both cameras."""
-    for m, selected_rows in selections.items():
-        if not selected_rows:
-            continue
+# ── Selection helpers — both tables support MULTI selection; the download
+# buttons act on the union of selected rows, or the latest run if none. ──────
+def _selected_runs(sel_map: dict) -> list:
+    """Session-row dicts for every selected row across both tables."""
+    out = []
+    for m in MODES:
         runs = SESSIONS[m].snapshot()["session"]
-        i = selected_rows[0]
-        if 0 <= i < len(runs):
-            r = runs[i]
-            csvf = r.get("csv_file")
-            if csvf and csvf != "(none)":
-                p = OUTPUT_DIR / csvf
-                if p.exists():
-                    return p, (r.get("plot") or "").strip()
-        return None, None
-    latest = max((SESSIONS[m].snapshot() for m in MODES),
-                 key=lambda s: s["last_csv_time"], default=None)
-    if latest and latest["last_csv"] and Path(latest["last_csv"]).exists():
-        return Path(latest["last_csv"]), (latest.get("last_plot") or "").strip()
-    return None, None
+        for i in (sel_map.get(m) or []):
+            if 0 <= i < len(runs):
+                out.append(runs[i])
+    return out
 
 
-def _resolve_export_row(selections: dict) -> Optional[dict]:
-    """The session-row dict for the selected history row in either table,
-    else the most recent completed run across both cameras."""
-    for m, selected_rows in selections.items():
-        if not selected_rows:
-            continue
-        runs = SESSIONS[m].snapshot()["session"]
-        i = selected_rows[0]
-        return runs[i] if 0 <= i < len(runs) else None
+def _latest_run_row() -> Optional[dict]:
+    """The most recently completed run (with a CSV) across both cameras."""
     latest = max((SESSIONS[m].snapshot() for m in MODES),
                  key=lambda s: s["last_csv_time"], default=None)
     if not latest or not latest["last_csv"]:
@@ -1366,6 +1391,16 @@ def _resolve_export_row(selections: dict) -> Optional[dict]:
             if r.get("csv_file") == csv_name:
                 return r
     return None
+
+
+def _rows_with_csv(rows: list) -> list:
+    """(row, csv_path) pairs for rows whose CSV exists on disk."""
+    out = []
+    for r in rows:
+        csvf = r.get("csv_file")
+        if csvf and csvf != "(none)" and (OUTPUT_DIR / csvf).exists():
+            out.append((r, OUTPUT_DIR / csvf))
+    return out
 
 
 def _session_file_prefix() -> str:
@@ -1385,17 +1420,32 @@ def _session_file_prefix() -> str:
     prevent_initial_call=True,
 )
 def local_download(_n, filename, sel_a, sel_b):
-    csv_path, _plot = _resolve_export_run({MODES[0]: sel_a, MODES[-1]: sel_b})
-    if csv_path is None:
+    rows = _selected_runs({MODES[0]: sel_a, MODES[-1]: sel_b})
+    if not rows:
+        rows = [r for r in [_latest_run_row()] if r]
+    pairs = _rows_with_csv(rows)
+    if not pairs:
         return dash.no_update, dbc.Alert(
-            "No recording available for the selected run yet.",
+            "No recordings available for the selected run(s) yet.",
             color="warning", className="small mb-0")
-    name = (filename or "").strip() or csv_path.name
-    if not name.lower().endswith(".csv"):
-        name += ".csv"
-    return (dcc.send_file(str(csv_path), filename=name),
-            dbc.Alert(f"Downloading {name}", color="success",
-                      dismissable=True, className="small mb-0"))
+    if len(pairs) == 1:
+        _row, csv_path = pairs[0]
+        name = (filename or "").strip() or csv_path.name
+        if not name.lower().endswith(".csv"):
+            name += ".csv"
+        return (dcc.send_file(str(csv_path), filename=name),
+                dbc.Alert(f"Downloading {name}", color="success",
+                          dismissable=True, className="small mb-0"))
+    # Several selected → one zip.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for _row, p in pairs:
+            z.write(p, arcname=p.name)
+    name = f"{_session_file_prefix()}_selected_raw.zip"
+    return (dcc.send_bytes(buf.getvalue(), filename=name),
+            dbc.Alert(f"Downloading {name} — {len(pairs)} run CSV(s)",
+                      color="success", dismissable=True,
+                      className="small mb-0"))
 
 
 @app.callback(
@@ -1426,20 +1476,22 @@ def summary_download(_n):
     prevent_initial_call=True,
 )
 def run_summary_download(_n, sel_a, sel_b):
-    row = _resolve_export_row({MODES[0]: sel_a, MODES[-1]: sel_b})
-    if not row or not row.get("csv_file") or row["csv_file"] == "(none)":
-        return dash.no_update, dbc.Alert(
-            "No recording available for the selected run yet.",
-            color="warning", className="small mb-0")
-    df = session_summary_table([row], OUTPUT_DIR)
+    rows = _selected_runs({MODES[0]: sel_a, MODES[-1]: sel_b})
+    if not rows:
+        rows = [r for r in [_latest_run_row()] if r]
+    df = session_summary_table(rows, OUTPUT_DIR)
     if df.empty:
         return dash.no_update, dbc.Alert(
-            "Could not summarize that run (CSV missing?).",
+            "No recordings available for the selected run(s) yet.",
             color="warning", className="small mb-0")
-    name = f"summary_{Path(row['csv_file']).stem}.csv"
+    if len(rows) == 1 and rows[0].get("csv_file") not in (None, "(none)"):
+        name = f"summary_{Path(rows[0]['csv_file']).stem}.csv"
+    else:
+        name = f"{_session_file_prefix()}_selected_summary.csv"
     return (dcc.send_string(df.to_csv(index=False), filename=name),
-            dbc.Alert(f"Downloading {name}", color="success",
-                      dismissable=True, className="small mb-0"))
+            dbc.Alert(f"Downloading {name} — {len(df)} row(s)",
+                      color="success", dismissable=True,
+                      className="small mb-0"))
 
 
 @app.callback(
@@ -1748,10 +1800,18 @@ def dropbox_download(_n, folder, filename, sel_a, sel_b):
     if team_manager is None:
         return dbc.Alert("Dropbox client not configured (check .env).",
                          color="danger", className="small mb-0")
-    csv_path, _plot = _resolve_export_run({MODES[0]: sel_a, MODES[-1]: sel_b})
-    if csv_path is None:
+    rows = _selected_runs({MODES[0]: sel_a, MODES[-1]: sel_b})
+    if len(rows) > 1:
+        return dbc.Alert("Select a single run for the CSV upload (or use "
+                         "the summary/append tools for many).",
+                         color="warning", className="small mb-0")
+    if not rows:
+        rows = [r for r in [_latest_run_row()] if r]
+    pairs = _rows_with_csv(rows)
+    if not pairs:
         return dbc.Alert("No recording available for the selected run yet.",
                          color="warning", className="small mb-0")
+    csv_path = pairs[0][1]
     name = (filename or "").strip() or csv_path.name
     if not name.lower().endswith(".csv"):
         name += ".csv"
