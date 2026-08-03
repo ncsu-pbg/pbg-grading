@@ -542,10 +542,34 @@ def build_camera_panel(mode: str) -> dbc.Col:
                          className="text-muted small mb-2"),
                 html.Div(id=f"runs-progress-{mode}", className="mb-2"),
                 html.Div(id=f"runs-result-{mode}", className="small mb-2"),
-                html.Div(id=f"runs-list-{mode}",
-                         style={"maxHeight": "380px", "overflowY": "auto"}),
+                html.Div(id=f"runs-list-{mode}", className="small mb-1"),
+                # Permanent (initially empty) so callbacks can reference it
+                # before the modal has ever been opened — a dynamically
+                # created component here breaks the whole callback chain.
+                html.Div(dbc.Checklist(
+                    id=f"runs-select-{mode}", options=[], value=[],
+                    inputStyle={"marginRight": "8px"},
+                    labelStyle={"fontFamily": "monospace",
+                                "fontSize": "12px", "display": "block",
+                                "padding": "3px 0",
+                                "borderBottom": "1px solid #f0f0f0"}),
+                    style={"maxHeight": "380px", "overflowY": "auto"}),
             ]),
             dbc.ModalFooter([
+                dbc.Button("Select all", id=f"runs-selall-{mode}",
+                           size="sm", outline=True, color="secondary",
+                           n_clicks=0),
+                dbc.Button([html.I(className="bi bi-download me-1"),
+                            "Download Selected"],
+                           id=f"runs-dl-selected-{mode}",
+                           size="sm", style=BTN_GREEN, n_clicks=0),
+                dbc.Button([html.I(className="bi bi-trash me-1"),
+                            "Delete Selected"],
+                           id=f"runs-del-selected-{mode}",
+                           size="sm", color="danger", outline=True,
+                           n_clicks=0,
+                           title="Removes the selected runs from the "
+                                 "camera permanently."),
                 dbc.Button([html.I(className="bi bi-arrow-clockwise me-1"),
                             "Refresh"], id=f"runs-refresh-{mode}",
                            size="sm", style=BTN_DARK),
@@ -626,16 +650,17 @@ def build_admin_camera_tools(mode: str):
 
 
 def render_runs_list(mode: str):
-    """Table of the camera's stored runs with per-row actions."""
+    """(summary_children, checklist_options, disabled_values) for the
+    camera's stored runs."""
     ctl = CONTROLLERS[mode]
     try:
         runs = ctl.list_runs()
     except CameraClientError as e:
-        return html.Div(f"Could not list runs: {e}",
-                        className="text-danger small p-2")
+        return (html.Div(f"Could not list runs: {e}",
+                         className="text-danger small p-2"), [], [])
     if not runs:
-        return html.Div("No stored runs on this camera.",
-                        className="text-muted small p-2")
+        return (html.Div("No stored runs on this camera.",
+                         className="text-muted small p-2"), [], [])
     total_mb = sum(r.get("bytes", 0) for r in runs) / 1e6
     # Retention figures come from the camera itself (/status), so this
     # line can't drift out of date when the policy is retuned.
@@ -651,33 +676,24 @@ def render_runs_list(mode: str):
         f"{policy} (oldest first), so download anything you want to "
         f"keep.{disk_txt}",
         className="text-muted small mb-2")]
+    options, disabled = [], []
     for r in runs:
         name = r.get("name", "")
         size_mb = r.get("bytes", 0) / 1e6
-        badges = []
+        tags = []
         if r.get("active"):
-            badges.append(dbc.Badge("running", color="success",
-                                    className="me-1"))
+            tags.append("running")
+            disabled.append(name)
         if r.get("has_csv"):
-            badges.append(dbc.Badge("csv", color="secondary",
-                                    className="me-1"))
-        rows.append(dbc.Row([
-            dbc.Col(html.Span(name, style={"fontFamily": "monospace",
-                                           "fontSize": "12px"}), md=5),
-            dbc.Col(html.Span(f"{r.get('files', 0)} files · {size_mb:.1f} MB",
-                              className="text-muted small"), md=3),
-            dbc.Col(badges, md=1),
-            dbc.Col(dbc.Button("Download",
-                               id={"type": f"run-dl-{mode}", "name": name},
-                               size="sm", style=BTN_DARK, className="w-100",
-                               disabled=bool(r.get("active"))), md=2),
-            dbc.Col(dbc.Button(html.I(className="bi bi-trash"),
-                               id={"type": f"run-del-{mode}", "name": name},
-                               size="sm", color="danger", outline=True,
-                               className="w-100",
-                               disabled=bool(r.get("active"))), md=1),
-        ], className="g-2 align-items-center py-1 border-bottom"))
-    return rows
+            tags.append("csv")
+        suffix = f"  [{', '.join(tags)}]" if tags else ""
+        options.append({
+            "label": (f"{name}   ·   {r.get('files', 0)} files · "
+                      f"{size_mb:,.0f} MB{suffix}"),
+            "value": name,
+            "disabled": name in disabled,
+        })
+    return rows, options, disabled
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1452,55 +1468,88 @@ def register_panel_callbacks(mode: str) -> None:
         return items
 
     # ── Stored-runs modal (opened from Admin) ────────────────────────────────
+    # Multi-select: tick any number of runs, then Download/Delete Selected.
+    # Downloads queue on the per-camera worker (serialized, progress above).
     @app.callback(
         Output(f"runs-modal-{mode}", "is_open"),
         Output(f"runs-list-{mode}", "children"),
+        Output(f"runs-select-{mode}", "options"),
+        Output(f"runs-select-{mode}", "value", allow_duplicate=True),
         Output(f"runs-result-{mode}", "children"),
         Input(f"runs-open-{mode}", "n_clicks"),
         Input(f"runs-close-{mode}", "n_clicks"),
         Input(f"runs-refresh-{mode}", "n_clicks"),
-        Input({"type": f"run-dl-{mode}", "name": ALL}, "n_clicks"),
-        Input({"type": f"run-del-{mode}", "name": ALL}, "n_clicks"),
+        Input(f"runs-dl-selected-{mode}", "n_clicks"),
+        Input(f"runs-del-selected-{mode}", "n_clicks"),
+        State(f"runs-select-{mode}", "value"),
         prevent_initial_call=True,
     )
-    def runs_modal(_o, _c, _r, _dl, _de, _mode=mode):
+    def runs_modal(_o, _c, _r, _dl, _de, selected, _mode=mode):
         trig = dash.ctx.triggered_id
+        ctlr = CONTROLLERS[_mode]
+        keep = (dash.no_update,) * 3            # list, options, value
         if trig == f"runs-close-{_mode}":
-            return False, [], ""
+            return False, *keep, ""
         if trig in (f"runs-open-{_mode}", f"runs-refresh-{_mode}"):
             if trig == f"runs-refresh-{_mode}":
-                CONTROLLERS[_mode].clear_finished_downloads()
-            return True, render_runs_list(_mode), ""
-        if isinstance(trig, dict):
-            if not dash.ctx.triggered[0]["value"]:
-                raise dash.exceptions.PreventUpdate
-            ctlr = CONTROLLERS[_mode]
-            name = trig.get("name", "")
-            if trig.get("type") == f"run-dl-{_mode}":
-                # Queue in the background — big tarballs take minutes and
-                # must not block this callback. Size (for the progress %)
-                # comes from the listing.
-                total = 0
-                try:
-                    total = next((r.get("bytes", 0) for r in ctlr.list_runs()
-                                  if r.get("name") == name), 0)
-                except CameraClientError:
-                    pass
-                err = ctlr.download_run_async(name, total_bytes=total)
-                msg = (html.Span(err, className="text-warning") if err else
-                       html.Span(f"Download of {name} started — progress "
-                                 f"below.", className="text-success"))
-                return True, render_runs_list(_mode), msg
-            if trig.get("type") == f"run-del-{_mode}":
+                ctlr.clear_finished_downloads()
+            summary, options, _dis = render_runs_list(_mode)
+            return True, summary, options, [], ""
+        selected = selected or []
+        if not selected:
+            return (True, *keep,
+                    html.Span("Tick at least one run first.",
+                              className="text-warning"))
+        if trig == f"runs-dl-selected-{_mode}":
+            try:
+                sizes = {r["name"]: r.get("bytes", 0)
+                         for r in ctlr.list_runs()}
+            except CameraClientError:
+                sizes = {}
+            queued, busy = [], []
+            for name in selected:
+                err = ctlr.download_run_async(
+                    name, total_bytes=sizes.get(name, 0))
+                (busy if err else queued).append(name)
+            parts = []
+            if queued:
+                parts.append(f"✓ {len(queued)} download(s) queued — "
+                             f"progress above; they run one at a time.")
+            if busy:
+                parts.append(f"{len(busy)} already in flight.")
+            return (True, dash.no_update, dash.no_update, [],
+                    html.Span("  ".join(parts), className="text-success"))
+        if trig == f"runs-del-selected-{_mode}":
+            done, failed = [], []
+            for name in selected:
                 try:
                     ctlr.delete_run(name)
-                    msg = html.Span(f"✓ Deleted {name} from the camera.",
-                                    className="text-success")
+                    done.append(name)
                 except CameraClientError as e:
-                    msg = html.Span(f"Delete failed: {e}",
-                                    className="text-danger")
-                return True, render_runs_list(_mode), msg
+                    failed.append(f"{name} ({e})")
+            msg = []
+            if done:
+                msg.append(f"✓ Deleted {len(done)} run(s) from the camera.")
+            if failed:
+                msg.append("Failed: " + "; ".join(failed))
+            summary, options, _dis = render_runs_list(_mode)
+            return (True, summary, options, [],
+                    html.Span(" ".join(msg),
+                              className=("text-danger" if failed
+                                         else "text-success")))
         raise dash.exceptions.PreventUpdate
+
+    # Select all / clear (toggles between all enabled runs and none).
+    @app.callback(
+        Output(f"runs-select-{mode}", "value"),
+        Input(f"runs-selall-{mode}", "n_clicks"),
+        State(f"runs-select-{mode}", "options"),
+        State(f"runs-select-{mode}", "value"),
+        prevent_initial_call=True,
+    )
+    def runs_select_all(_n, options, value, _mode=mode):
+        all_vals = [o["value"] for o in (options or [])]
+        return [] if set(value or []) == set(all_vals) else all_vals
 
 
 for _m in MODES:
