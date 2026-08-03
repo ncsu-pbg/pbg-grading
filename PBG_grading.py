@@ -421,8 +421,11 @@ def build_camera_panel(mode: str) -> dbc.Col:
                     weight_col,
                 ], className="g-2 mb-2"),
 
+                # On by default: an ungraded run can be re-analysed later
+                # only if its frames were kept, and the camera now has a
+                # 30-day / 50 GB retention window to hold them.
                 html.Div(dbc.Checkbox(
-                    id=f"saveframes-{mode}", value=False,
+                    id=f"saveframes-{mode}", value=True,
                     label="Save frames for this run (stored on the camera "
                           "— fetch via Admin → Stored Runs…)"),
                     id=f"saveframes-wrap-{mode}", className="mb-2"),
@@ -1254,12 +1257,13 @@ def register_panel_callbacks(mode: str) -> None:
         if err:
             return (dbc.Alert(err, color="warning", dismissable=True,
                               className="small mb-0"),) + (dash.no_update,) * 5
-        # Clear every per-sample input — including frame saving, so one
-        # special run can't silently save frames for the whole day.
+        # Clear every per-sample input and return frame saving to its
+        # default (on), so turning it off for one run can't quietly lose
+        # the images for the rest of the day.
         return (dbc.Alert("Stopping — results land in the session table.",
                           color="warning", dismissable=True, duration=4000,
                           className="small mb-0"),
-                "", "", None, False, "")
+                "", "", None, True, "")
 
     # ── QR scan → sample name + plot (+ trial verification in Grading) ───────
     @app.callback(
