@@ -634,10 +634,19 @@ def render_runs_list(mode: str):
         return html.Div("No stored runs on this camera.",
                         className="text-muted small p-2")
     total_mb = sum(r.get("bytes", 0) for r in runs) / 1e6
+    # Retention figures come from the camera itself (/status), so this
+    # line can't drift out of date when the policy is retuned.
+    s = ctl.snapshot()
+    days, cap = s.get("runs_retention_days"), s.get("runs_max_gb")
+    free, disk = s.get("disk_free_gb"), s.get("disk_total_gb")
+    policy = (f"auto-pruned after {days:.0f} days or past {cap:.0f} GB total"
+              if days and cap else "auto-pruned periodically")
+    disk_txt = (f"  ·  {free:,.0f} GB free of {disk:,.0f} GB on the camera"
+                if free and disk else "")
     rows = [html.Div(
-        f"{len(runs)} run(s) · {total_mb:,.0f} MB on the camera — runs are "
-        f"auto-pruned after 7 days or past 10 GB total (oldest first), so "
-        f"download anything you want to keep.",
+        f"{len(runs)} run(s) · {total_mb:,.0f} MB stored — runs are "
+        f"{policy} (oldest first), so download anything you want to "
+        f"keep.{disk_txt}",
         className="text-muted small mb-2")]
     for r in runs:
         name = r.get("name", "")

@@ -738,6 +738,11 @@ class CameraController:
             "pending_restart": bool(s.get("pending_fingerprint")),
             "save_frames": bool(s.get("save_frames", False)),
             "frames_saved": int(s.get("frames_saved", 0)),
+            # Retention policy + disk, reported by the camera (v0.6.3+).
+            "runs_retention_days": s.get("runs_retention_days"),
+            "runs_max_gb": s.get("runs_max_gb"),
+            "disk_free_gb": s.get("disk_free_gb"),
+            "disk_total_gb": s.get("disk_total_gb"),
         })
         return d
 
