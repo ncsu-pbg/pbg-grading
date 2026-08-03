@@ -281,8 +281,34 @@ def _auto_append(ctl, info: dict) -> None:
                  f"Admin export tools.")
 
 
+# ── Pod → seed handoff ───────────────────────────────────────────────────────
+# In practice a plot is graded on the pod camera and then goes straight to
+# the seed camera, so the seed panel pre-fills itself from the pod run that
+# just finished. Published only AFTER the trial append has run, so a failed
+# append can never be mistaken for a seed-side problem. The operator can
+# still overwrite either field (or scan a different tag) before starting.
+POD_MODE = "pod" if "pod" in MODES else None
+SEED_MODE = "seed" if "seed" in MODES else None
+_HANDOFF: dict = {"seq": 0, "name": "", "plot": ""}
+_HANDOFF_LOCK = threading.Lock()
+
+
+def _on_run_complete(ctl, info: dict) -> None:
+    _auto_append(ctl, info)              # contains its own error handling
+    if ctl.mode != POD_MODE or SEED_MODE is None:
+        return
+    if not info.get("plot_name"):
+        return
+    with _HANDOFF_LOCK:
+        _HANDOFF["seq"] += 1
+        _HANDOFF["name"] = info.get("plot_name", "")
+        _HANDOFF["plot"] = info.get("plot", "")
+    ctl._log(f"Handed {info.get('plot') or info.get('plot_name')} to the "
+             f"{SEED_MODE} panel.")
+
+
 for _c in CONTROLLERS.values():
-    _c.on_run_complete = _auto_append
+    _c.on_run_complete = _on_run_complete
     _c.start_polling()
 
 
@@ -533,18 +559,22 @@ def build_camera_panel(mode: str) -> dbc.Col:
                 html.Div(id=f"wm-info-{mode}", className="mb-2"),
                 dbc.InputGroup([
                     dbc.Input(id=f"wm-weight-{mode}", type="number", min=0,
-                              placeholder="e.g. 200", autofocus=True),
+                              placeholder="e.g. 200", autofocus=True,
+                              n_submit=0),
                     dbc.InputGroupText("g"),
                 ]),
+                html.Div("Type the weight and press Enter, or click Save.",
+                         className="text-muted", style={"fontSize": "11px"}),
                 html.Div(id=f"wm-error-{mode}", className="small mt-1",
                          style={"minHeight": "1em"}),
+                dcc.Store(id=f"wm-seen-{mode}", data=None),
             ]),
             dbc.ModalFooter([
                 dbc.Button("No recorded weight", id=f"wm-skip-{mode}",
-                           size="sm", style=BTN_DARK,
+                           size="sm", style=BTN_DARK, n_clicks=0,
                            title="Leave the weight blank for this run"),
                 dbc.Button("Save Weight", id=f"wm-save-{mode}",
-                           size="sm", style=BTN_GREEN),
+                           size="sm", style=BTN_GREEN, n_clicks=0),
             ]),
         ], id=f"wm-modal-{mode}", is_open=False, backdrop="static",
            keyboard=False),
@@ -646,6 +676,9 @@ app.layout = dbc.Container([
 
     dcc.Interval(id="poll", interval=1000, n_intervals=0),
     dcc.Store(id="admin-auth", data=False, storage_type="session"),
+    # Which pod run the seed panel has already been auto-populated from
+    # (see the pod -> seed handoff below).
+    dcc.Store(id="handoff-seen", data=0),
     dcc.Store(id="fb-path", data=DROPBOX_ROOT, storage_type="session"),
     dcc.Store(id="fb-selected-folder", data=DROPBOX_DEFAULT_DEST),
     dcc.Store(id="afb-path", data=DROPBOX_ROOT, storage_type="session"),
@@ -684,6 +717,11 @@ app.layout = dbc.Container([
                       style={"maxWidth": "220px"}),
             dbc.Button("Set", id="btn-session-name", size="sm",
                        style=BTN_DARK),
+            dbc.Button("+ New", id="btn-session-new", size="sm",
+                       style=BTN_DARK, n_clicks=0,
+                       title="Close this session and start a fresh one "
+                             "(both cameras). Nothing is lost — the current "
+                             "session stays on disk and can be reloaded."),
         ], size="sm"), width="auto", className="ms-auto"),
         dbc.Col(html.Div(id="session-name-result", className="small",
                          style={"minHeight": "1em"}), width="auto"),
@@ -831,6 +869,31 @@ app.layout = dbc.Container([
         "fontSize": "12px", "fontFamily": "monospace", "borderRadius": "4px",
     }), width=12), className="mt-2 mb-4"),
 
+    # New-session confirmation
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Start a New Session?")),
+        dbc.ModalBody([
+            html.Div(id="new-session-summary", className="mb-2"),
+            html.Div("The current session stays saved on disk — you can "
+                     "reload it any time from Previous sessions…. New runs "
+                     "will go into a fresh session on both cameras.",
+                     className="text-muted small"),
+            dbc.Row([
+                dbc.Col(html.Div("Name the new session (optional)",
+                                 style=LABEL_STYLE), width=12),
+                dbc.Col(dbc.Input(id="new-session-name", size="sm",
+                                  placeholder="e.g. LEW MET afternoon"),
+                        width=12),
+            ], className="g-2 mt-1"),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Cancel", id="ns-cancel", size="sm", style=BTN_DARK,
+                       n_clicks=0),
+            dbc.Button("Start New Session", id="ns-confirm", size="sm",
+                       style=BTN_GREEN, n_clicks=0),
+        ]),
+    ], id="new-session-modal", is_open=False),
+
     # Admin login modal
     dbc.Modal([
         dbc.ModalHeader(dbc.ModalTitle("Admin Login")),
@@ -965,6 +1028,80 @@ def set_session_name(_n, _s, poll_n, name):
         return html.Span("Session name cleared.",
                          className="text-muted"), dash.no_update
     return html.Span("✓ named", className="text-success"), dash.no_update
+
+
+# ── New session (both cameras) ───────────────────────────────────────────────
+@app.callback(
+    Output("new-session-modal", "is_open"),
+    Output("new-session-summary", "children"),
+    Output("session-name", "value", allow_duplicate=True),
+    Output("session-name-result", "children", allow_duplicate=True),
+    Input("btn-session-new", "n_clicks"),
+    Input("ns-cancel", "n_clicks"),
+    Input("ns-confirm", "n_clicks"),
+    State("new-session-name", "value"),
+    prevent_initial_call=True,
+)
+def new_session(_open, _cancel, _confirm, new_name):
+    trig = dash.ctx.triggered_id
+    if trig == "btn-session-new":
+        if any_running():
+            return (False, dash.no_update, dash.no_update,
+                    html.Span("Stop the running camera first.",
+                              className="text-danger"))
+        counts = ", ".join(
+            f"{CONTROLLERS[m].label} {len(SESSIONS[m].snapshot()['session'])}"
+            for m in MODES)
+        cur = SESSIONS[MODES[0]].snapshot()["name"] or "(unnamed)"
+        return (True,
+                html.Div([html.B(f"Current session: {cur}"),
+                          html.Span(f" — {counts} run(s) recorded.")]),
+                dash.no_update, "")
+    if trig == "ns-confirm":
+        name = str(new_name or "").strip()
+        for m in MODES:
+            SESSIONS[m].start_new(name)
+        label = f"'{name}'" if name else "(unnamed)"
+        return (False, dash.no_update, name,
+                html.Span(f"✓ new session {label}",
+                          className="text-success"))
+    return False, dash.no_update, dash.no_update, ""
+
+
+# ── Pod → seed autofill (consumes the handoff published after the append) ────
+if POD_MODE and SEED_MODE:
+    @app.callback(
+        Output(f"name-{SEED_MODE}", "value", allow_duplicate=True),
+        Output(f"plot-{SEED_MODE}", "value", allow_duplicate=True),
+        Output(f"qr-result-{SEED_MODE}", "children", allow_duplicate=True),
+        Output("handoff-seen", "data"),
+        Input("poll", "n_intervals"),
+        State("handoff-seen", "data"),
+        State("ui-mode", "value"),
+        prevent_initial_call=True,
+    )
+    def seed_autofill(_n, seen, ui_mode):
+        with _HANDOFF_LOCK:
+            seq, name, plot = (_HANDOFF["seq"], _HANDOFF["name"],
+                               _HANDOFF["plot"])
+        if not seq or seq == seen:
+            raise dash.exceptions.PreventUpdate
+        # Never overwrite a run in progress; wait for it to finish.
+        if CONTROLLERS[SEED_MODE].snapshot()["running"]:
+            raise dash.exceptions.PreventUpdate
+        if ui_mode == "test":
+            return name, plot, html.Span(
+                f"↳ from pod: {name} (test mode)",
+                className="text-success"), seq
+        # Re-verify for the seed side: the pod append just landed, so this
+        # normally confirms the plot is now ready to shell.
+        trial_path, err = verify_before_start(SEED_MODE, name, plot)
+        if err:
+            return name, plot, html.Span(f"↳ from pod — ✗ {err}",
+                                         className="text-danger"), seq
+        return name, plot, html.Span(
+            f"↳ from pod ✓ Plot {plot} → will append to "
+            f"{Path(trial_path).name}", className="text-success"), seq
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1151,42 +1288,57 @@ def register_panel_callbacks(mode: str) -> None:
             className="text-success")
 
     # ── Post-run weight popup (weighed-after-shelling modes) ─────────────────
+    # Two callbacks on purpose. When opening and answering shared one
+    # callback, a poll tick landing before the client had committed
+    # is_open=True re-ran the open branch and blanked the field the
+    # operator had just typed into — which showed up as "Save needs two
+    # clicks". The open guard is now the run number, not is_open, so it
+    # can fire only once per finished run no matter how the ticks land.
     if ctl.weight_after_stop:
         @app.callback(
             Output(f"wm-modal-{mode}", "is_open"),
             Output(f"wm-info-{mode}", "children"),
             Output(f"wm-weight-{mode}", "value"),
             Output(f"wm-error-{mode}", "children"),
+            Output(f"wm-seen-{mode}", "data"),
             Input("poll", "n_intervals"),
-            Input(f"wm-save-{mode}", "n_clicks"),
-            Input(f"wm-skip-{mode}", "n_clicks"),
-            State(f"wm-weight-{mode}", "value"),
-            State(f"wm-modal-{mode}", "is_open"),
+            State(f"wm-seen-{mode}", "data"),
             prevent_initial_call=True,
         )
-        def weight_modal(_n, _s, _k, weight, is_open, _mode=mode):
+        def weight_modal_open(_n, seen, _mode=mode):
             ctlr = CONTROLLERS[_mode]
-            trig = dash.ctx.triggered_id
-            if trig == f"wm-save-{_mode}":
-                err = ctlr.set_pending_weight(
-                    "" if weight is None else str(weight))
-                if err:
-                    return (True, dash.no_update, dash.no_update,
-                            html.Span(err, className="text-danger"))
-                return False, dash.no_update, None, ""
-            if trig == f"wm-skip-{_mode}":
-                ctlr.set_pending_weight(None)
-                return False, dash.no_update, None, ""
             pending = ctlr.snapshot().get("pending_weight")
-            if pending and not is_open:
-                info = html.Div([
-                    html.B(f"{pending['plot']}"),
-                    html.Span(f" — {pending['count']} "
-                              f"{ctlr.label.lower()}s counted. Enter the "
-                              f"shelled sample weight:"),
-                ])
-                return True, info, None, ""
-            raise dash.exceptions.PreventUpdate
+            if not pending or pending.get("n") == seen:
+                raise dash.exceptions.PreventUpdate
+            info = html.Div([
+                html.B(f"{pending['plot']}"),
+                html.Span(f" — {pending['count']} "
+                          f"{ctlr.label.lower()}s counted. Enter the "
+                          f"shelled sample weight:"),
+            ])
+            return True, info, None, "", pending.get("n")
+
+        @app.callback(
+            Output(f"wm-modal-{mode}", "is_open", allow_duplicate=True),
+            Output(f"wm-weight-{mode}", "value", allow_duplicate=True),
+            Output(f"wm-error-{mode}", "children", allow_duplicate=True),
+            Input(f"wm-save-{mode}", "n_clicks"),
+            Input(f"wm-weight-{mode}", "n_submit"),
+            Input(f"wm-skip-{mode}", "n_clicks"),
+            State(f"wm-weight-{mode}", "value"),
+            prevent_initial_call=True,
+        )
+        def weight_modal_answer(_s, _e, _k, weight, _mode=mode):
+            ctlr = CONTROLLERS[_mode]
+            if dash.ctx.triggered_id == f"wm-skip-{_mode}":
+                ctlr.set_pending_weight(None)
+                return False, None, ""
+            err = ctlr.set_pending_weight(
+                "" if weight is None else str(weight))
+            if err:
+                return (dash.no_update, dash.no_update,
+                        html.Span(err, className="text-danger"))
+            return False, None, ""
 
     # ── App lifecycle (restart in panel; start/stop in Admin) ────────────────
     @app.callback(

@@ -77,6 +77,21 @@ class SessionLog:
             self.name = str(name or "").strip()
         self._persist()
 
+    def start_new(self, name: str = "") -> None:
+        """Close out the current session and begin a fresh one in the same
+        app instance. Nothing is lost — the previous session is already
+        persisted under its own timestamped file and can be reloaded."""
+        with self._lock:
+            self.runs = []
+            self.name = str(name or "").strip()
+            self.session_path = (
+                self.sessions_dir /
+                f"session_{self.mode}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            self.last_csv_path = None
+            self.last_csv_time = 0.0
+            self.last_plot = ""
+        self._persist()
+
     def add_run(self, mode_label: str, plot_name: str, plot: str,
                 weight: str, count: int, elapsed: str, csv_file: str,
                 csv_path: Optional[Path] = None) -> int:

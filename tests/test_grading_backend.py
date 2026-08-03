@@ -407,3 +407,26 @@ def test_async_download_manager(controller, fake_cam, tmp_path):
     assert "Downloaded old_run_1" in controller.snapshot()["log"]
     controller.clear_finished_downloads()
     assert controller.snapshot()["downloads"] == []
+
+
+def test_start_new_session(tmp_path):
+    s = SessionLog(tmp_path, "pod")
+    s.set_name("morning")
+    s.add_run("Pod", "2026_T_NC_X_101", "101", "150", 42, "01:00", "a.csv")
+    first_path = s.session_path
+    assert len(s.snapshot()["session"]) == 1
+
+    time.sleep(1.1)                     # distinct timestamp in the filename
+    s.start_new("afternoon")
+    snap = s.snapshot()
+    assert snap["session"] == [] and snap["name"] == "afternoon"
+    assert snap["last_csv"] == "" and snap["last_plot"] == ""
+    assert s.session_path != first_path
+
+    # The old session is still on disk and reloadable.
+    assert first_path.exists()
+    s2 = SessionLog(tmp_path, "pod")
+    n, err = s2.load_session(str(first_path))
+    assert err is None and n == 1 and s2.snapshot()["name"] == "morning"
+    # Both sessions show in the list.
+    assert len(s.list_sessions()) >= 2
