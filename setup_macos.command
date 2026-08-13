@@ -53,7 +53,7 @@ echo "==> Building environment from environment.yml (several minutes on first ru
 "$MM" create -y -p "$ENV_PREFIX" -f environment.yml
 
 echo "==> Verifying imports…"
-"$MM" run -p "$ENV_PREFIX" python -c "import dash, plotly, numpy, pandas, scipy, cv2, yaml, dotenv, requests, dropbox, depthai, PyQt6.QtCore; print('  python', __import__('sys').version.split()[0]); print('  depthai', depthai.__version__); print('  opencv', cv2.__version__)"
+"$MM" run -p "$ENV_PREFIX" python -c "import dash, plotly, numpy, pandas, scipy, yaml, dotenv, requests, dropbox; print('  python', __import__('sys').version.split()[0]); print('  dash', dash.__version__)"
 
 echo ""
 echo "Setup complete. Double-click 'Start PBG Grading.command' to launch the app."

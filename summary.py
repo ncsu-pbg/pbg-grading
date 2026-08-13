@@ -57,7 +57,47 @@ def all_summary_columns() -> list:
         for label, _ in _MEASURES:
             for stat in ("M", "V", "S", "K"):
                 cols.append(f"{pfx} {label} [{stat}]")
+        # Whole-sample colour: mean coat colour as a hex code for both
+        # modes; Hunter L (lightness) additionally for pods.
+        if pfx == "Pod":
+            cols.append("Pod Hunter L")
+        cols.append(f"{pfx} Color [hex]")
     return cols
+
+
+# ── Colour averaging ─────────────────────────────────────────────────────────
+# Hex codes are gamma-encoded sRGB; a perceptually meaningful average must
+# be computed in LINEAR light (decode → mean → re-encode). Averaging the
+# hex bytes directly would bias dark.
+
+def _srgb_to_linear(c: float) -> float:
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_srgb(c: float) -> float:
+    c = max(0.0, min(1.0, c))
+    return c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+
+
+def average_hex(values) -> str:
+    """Mean of '#RRGGBB' colours in linear-light space; '' if none valid."""
+    sums = [0.0, 0.0, 0.0]
+    n = 0
+    for v in values:
+        s = str(v or "").strip().lstrip("#")
+        if len(s) != 6:
+            continue
+        try:
+            rgb = [int(s[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+        except ValueError:
+            continue
+        for i in range(3):
+            sums[i] += _srgb_to_linear(rgb[i])
+        n += 1
+    if n == 0:
+        return ""
+    return "#" + "".join(
+        f"{round(_linear_to_srgb(s / n) * 255):02x}" for s in sums)
 
 
 def parse_qr(text: str) -> Optional[Dict[str, str]]:
@@ -140,6 +180,14 @@ def compute_summary(csv_path, mode: str, plot_weight="", plot=None) -> Dict[str,
         out[f"{pfx} {label} [V]"] = _num(s.var()) if n else ""            # ddof=1
         out[f"{pfx} {label} [S]"] = _num(skew(s)) if n else ""            # biased
         out[f"{pfx} {label} [K]"] = _num(kurtosis(s)) if n else ""        # excess, biased
+
+    # Whole-sample colour (blank when the run had no colour calibration).
+    if pfx == "Pod":
+        hl = (pd.to_numeric(df["hunter_l"], errors="coerce").dropna()
+              if "hunter_l" in df.columns else pd.Series(dtype=float))
+        out["Pod Hunter L"] = _num(hl.mean()) if len(hl) else ""
+    out[f"{pfx} Color [hex]"] = (average_hex(df["color_hex"])
+                                 if "color_hex" in df.columns else "")
 
     return out
 
@@ -240,6 +288,14 @@ def merge_summary_into_workbook(existing_bytes: bytes, summary: Dict[str, object
             # values so far); pandas 3 raises rather than upcast on a float
             # write, so upcast explicitly.
             data[col] = data[col].astype("float64")
+        elif (isinstance(val, str)
+                and not (data[col].dtype == object
+                         or pd.api.types.is_string_dtype(data[col].dtype))):
+            # Same round-trip problem for text: an all-empty column (e.g.
+            # 'Seed Color [hex]' created by a pod-only append) reads back
+            # from Excel as float64 NaNs, and pandas 3 raises on writing a
+            # string into it. Upcast to object first.
+            data[col] = data[col].astype("object")
         data.loc[mask, col] = val
         updated.append(col)
 
