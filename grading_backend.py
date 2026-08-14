@@ -601,7 +601,14 @@ class CameraController:
                     try:
                         self.client.restart_app()
                     except CameraClientError:
-                        oakctl_tools.app_restart(self.ip)
+                        try:
+                            oakctl_tools.app_restart(self.ip)
+                        except oakctl_tools.OakctlError:
+                            # A cleanly-stopped container can't be
+                            # "restarted" — start it instead. This is the
+                            # red-light + "restart didn't help" case
+                            # (field report 2026-08-13).
+                            oakctl_tools.app_start(self.ip)
                 elif action == "stop":
                     try:
                         self.client.shutdown_app()
