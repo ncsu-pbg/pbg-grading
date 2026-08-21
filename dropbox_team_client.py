@@ -267,7 +267,14 @@ class TeamDropboxClientManager:
                 return result
                 
             except dropbox.exceptions.ApiError as e:
-                if e.error.is_path() and e.error.get_path().is_conflict():
+                # UploadError.get_path() returns an UploadWriteFailed
+                # wrapper — the WriteError lives one level down at
+                # .reason (unlike CreateFolderError.get_path(), which IS
+                # the WriteError). Checking is_conflict() on the wrapper
+                # raised AttributeError and masked the real upload error
+                # (field report 2026-08-20).
+                if (e.error.is_path()
+                        and e.error.get_path().reason.is_conflict()):
                     self.logger.warning(f"File conflict at {path}, retrying with autorename")
                     # Retry with autorename enabled
                     result = self.team_space_client.files_upload(
