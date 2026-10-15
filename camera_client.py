@@ -57,6 +57,14 @@ class CameraClient:
     def status(self) -> dict:
         return self._request("/status")
 
+    def set_time(self, epoch: float, tz_offset_s: int) -> dict:
+        """Tell the camera the wall time (pod-counter 0.7.4+): the OAK 4
+        has no RTC and restarts at 1970 after every power cut, so the
+        station's clock is the reference for run names and stamps."""
+        return self._request("/time", "POST", {
+            "epoch": float(epoch), "tz_offset": int(tz_offset_s),
+        })
+
     def start_run(self, plot_name: str, plot_weight: str,
                   save_frames: bool) -> dict:
         return self._request("/run/start", "POST", {

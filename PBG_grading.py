@@ -1276,6 +1276,19 @@ def register_panel_callbacks(mode: str) -> None:
             if s["staged_mode"] and s["staged_mode"] != _mode:
                 admin_lines.append(dbc.Badge("wrong staged mode!",
                                              color="danger"))
+            # camera clock (0.7.4+): the OAK 4 has no RTC — the station sets it
+            clk = s.get("clock")
+            if isinstance(clk, dict) and clk.get("synced"):
+                admin_lines.append(html.Div(
+                    f"clock: set from this PC · camera now {clk.get('now', '?')}"))
+            elif isinstance(clk, dict):
+                admin_lines.append(dbc.Badge(
+                    "camera clock unset (1970) — being set from this PC…",
+                    color="warning"))
+            elif s.get("app_version"):
+                admin_lines.append(dbc.Badge(
+                    f"camera clock not managed (app {s['app_version']} < 0.7.4)",
+                    color="warning"))
             if s["pending_restart"]:
                 admin_lines.append(dbc.Badge(
                     "config pushed — restart to apply", color="warning"))

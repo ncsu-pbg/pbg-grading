@@ -308,6 +308,28 @@ class CameraController:
             self.poll_once()
             self._stop_polling.wait(interval_s)
 
+    # Re-send the PC clock this often even when the camera says it is
+    # synced (bounds drift; also covers an app restart that lost it).
+    CLOCK_RESYNC_S = 3600.0
+
+    def _maybe_sync_clock(self, s: dict) -> None:
+        """pod-counter 0.7.4+ reports `clock`; the camera has no RTC, so
+        the station hands it the time whenever it is unsynced (fresh
+        power-up) or the last sync is older than CLOCK_RESYNC_S."""
+        clk = s.get("clock")
+        if not isinstance(clk, dict):
+            return                      # older app: nothing to do
+        if clk.get("synced") and (clk.get("set_s_ago") or 0) < self.CLOCK_RESYNC_S:
+            return
+        try:
+            tz = -time.timezone if not time.localtime().tm_isdst else -time.altzone
+            r = self.client.set_time(time.time(), tz)
+            was = "unset (1970)" if not clk.get("synced") else "resync"
+            self._log(f"Camera clock set from this PC ({was}): now "
+                      f"{(r.get('clock') or {}).get('now', '?')}")
+        except CameraClientError as e:
+            self._log(f"Could not set the camera clock: {e}")
+
     def poll_once(self) -> None:
         """One /status round-trip; updates cached state and handles the
         offline→online, adopt-running-run, and run-ended transitions."""
@@ -325,6 +347,8 @@ class CameraController:
                 self._log(f"Camera offline ({self.ip}).")
             self._maybe_auto_start()
             return
+
+        self._maybe_sync_clock(s)
 
         if not was_online:
             self._log(f"Camera online — pod-counter "
@@ -745,7 +769,7 @@ class CameraController:
                 "fps": 0.0, "elapsed": "00:00", "plot_name": "",
                 "app_version": "", "staged_mode": "", "staged_at": "",
                 "config_source": "", "pending_restart": False,
-                "idle_activity": None, "lighting": None,
+                "idle_activity": None, "lighting": None, "clock": None,
                 "save_frames": False, "frames_saved": 0,
             })
             return d
@@ -768,6 +792,8 @@ class CameraController:
             # no run); 0.7.2+: lighting monitor {status, median_gray, ...}.
             "idle_activity": s.get("idle_activity"),
             "lighting": s.get("lighting"),
+            # 0.7.4+: station-supplied clock {synced, now, ...}
+            "clock": s.get("clock"),
             "save_frames": bool(s.get("save_frames", False)),
             "frames_saved": int(s.get("frames_saved", 0)),
             # Retention policy + disk, reported by the camera (v0.6.3+).
