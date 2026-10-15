@@ -34,6 +34,16 @@ import oakctl_tools
 from camera_client import CameraClient, CameraClientError, DEFAULT_PORT
 
 
+def lighting_summary(lighting) -> str:
+    """'ok (68)' / 'low (34)' style one-liner from a camera's /status
+    lighting block (pod-counter 0.7.2+); '' when it isn't reported."""
+    if not isinstance(lighting, dict) or not lighting.get("status"):
+        return ""
+    st = str(lighting.get("status"))
+    g = lighting.get("median_gray")
+    return f"{st} ({g:.0f})" if isinstance(g, (int, float)) else st
+
+
 def format_elapsed(secs: float) -> str:
     m, s = divmod(int(secs), 60)
     return f"{m:02d}:{s:02d}"
@@ -94,7 +104,8 @@ class SessionLog:
 
     def add_run(self, mode_label: str, plot_name: str, plot: str,
                 weight: str, count: int, elapsed: str, csv_file: str,
-                csv_path: Optional[Path] = None) -> int:
+                csv_path: Optional[Path] = None,
+                light_at_start: str = "") -> int:
         with self._lock:
             self.runs.append({
                 "n": len(self.runs) + 1,
@@ -106,6 +117,10 @@ class SessionLog:
                 "elapsed": elapsed,
                 "csv_file": csv_file,
                 "appended": "",             # auto-append outcome (✓ / FAILED)
+                # Camera lighting-monitor reading at run start (0.7.2+),
+                # e.g. "ok (68)" / "low (34)" — a run pushed through the
+                # low-light warning stays identifiable.
+                "light_at_start": light_at_start,
             })
             if csv_path is not None:
                 self.last_csv_path = csv_path
@@ -267,6 +282,7 @@ class CameraController:
         self._run_plot_name = ""
         self._run_plot_weight = ""
         self._run_meta: dict = {}
+        self._run_light = ""          # lighting reading at run start
 
         self._auto_start_tried = False
         self._poll_thread: Optional[threading.Thread] = None
@@ -334,6 +350,7 @@ class CameraController:
                 self._run_plot = ""       # unknown for adopted runs
                 self._run_plot_weight = ""
                 self._run_meta = {}       # adopted runs never auto-append
+                self._run_light = ""
             self._log(f"Adopted run already in progress on the camera: "
                       f"{run_name} (sample '{s.get('plot_name', '')}'). "
                       f"Stop works normally; the CSV arrives at stop.")
@@ -416,6 +433,7 @@ class CameraController:
             self._run_plot_name = plot_name
             self._run_plot_weight = plot_weight
             self._run_meta = dict(meta or {})
+            self._run_light = lighting_summary(s.get("lighting"))
         self._log(f"Run started: {self._attached_run}  |  Plot: {plot or '—'} "
                   f" |  Weight: {plot_weight + 'g' if plot_weight else '—'}  |  "
                   f"frames {'ON (saved on camera)' if save_frames else 'off'}")
@@ -481,6 +499,7 @@ class CameraController:
             plot_weight = plot_weight or self._run_plot_weight
             plot = self._run_plot
             meta = dict(self._run_meta)
+            light_at_start = getattr(self, "_run_light", "")
 
         csv_name = "(none)"
         csv_path: Optional[Path] = None
@@ -506,6 +525,7 @@ class CameraController:
             mode_label=self.label, plot_name=plot_name, plot=plot,
             weight=plot_weight, count=n, elapsed=elapsed,
             csv_file=csv_name, csv_path=csv_path,
+            light_at_start=light_at_start,
         )
 
         # The CSV is safe locally — clear it from the camera so Stored
@@ -725,6 +745,7 @@ class CameraController:
                 "fps": 0.0, "elapsed": "00:00", "plot_name": "",
                 "app_version": "", "staged_mode": "", "staged_at": "",
                 "config_source": "", "pending_restart": False,
+                "idle_activity": None, "lighting": None,
                 "save_frames": False, "frames_saved": 0,
             })
             return d
@@ -743,6 +764,10 @@ class CameraController:
             "config_source": s.get("config_source", ""),
             # A pushed config overlay awaits an app restart to take effect.
             "pending_restart": bool(s.get("pending_fingerprint")),
+            # 0.7.0+: confident detections while idle (material flowing with
+            # no run); 0.7.2+: lighting monitor {status, median_gray, ...}.
+            "idle_activity": s.get("idle_activity"),
+            "lighting": s.get("lighting"),
             "save_frames": bool(s.get("save_frames", False)),
             "frames_saved": int(s.get("frames_saved", 0)),
             # Retention policy + disk, reported by the camera (v0.6.3+).

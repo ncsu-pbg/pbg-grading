@@ -385,9 +385,37 @@ def build_camera_panel(mode: str) -> dbc.Col:
         html.Span(id=f"light-{mode}", title="Green = ready, red = not ready",
                   style={**LIGHT_BASE, "backgroundColor": "#888",
                          "float": "right"}),
+        # Lighting monitor pill (camera 0.7.2+): quiet when ok, amber when
+        # low/high; empty on older cameras.
+        html.Span(id=f"lightpill-{mode}", className="float-end me-2",
+                  title="Lighting monitor: median scene brightness reported "
+                        "by the camera (expected 60–90)"),
     ])
 
+    lowlight_modal = dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("⚠ Warning: low light")),
+        dbc.ModalBody([
+            html.Div(["Lighting detection is reporting ",
+                      html.B("low light conditions"), " on the ",
+                      html.B(f"{ctl.label.lower()} camera"),
+                      " — are the lights on?"], className="mb-2"),
+            html.Div(id=f"ll-reading-{mode}", className="fw-bold mb-2"),
+            html.Div(["Low light blacks out colour and inflates sizes; "
+                      "counting still works. Press ", html.B("Continue"),
+                      " if this is intentional, or after turning the lights "
+                      "on (this reading updates live — give it up to 30 s)."],
+                     className="text-muted small"),
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Cancel", id=f"ll-cancel-{mode}", size="sm",
+                       style=BTN_DARK, n_clicks=0),
+            dbc.Button("Continue", id=f"ll-continue-{mode}", size="sm",
+                       style=BTN_GREEN, n_clicks=0),
+        ]),
+    ], id=f"ll-modal-{mode}", is_open=False)
+
     return dbc.Col([
+        lowlight_modal,
         dbc.Card([
             dbc.CardHeader(header, style=HEADER_STYLE),
             dbc.CardBody([
@@ -440,6 +468,10 @@ def build_camera_panel(mode: str) -> dbc.Col:
                                        style=BTN_RED, className="w-100",
                                        disabled=True), width=6),
                 ], className="g-2 mb-2"),
+                # "material moving but no run started" (camera 0.7.0+) and
+                # low/high light (0.7.2+) — informational, never block a run.
+                html.Div(id=f"idlewarn-{mode}"),
+                html.Div(id=f"lightwarn-{mode}"),
                 html.Div(id=f"alert-{mode}", className="mb-1"),
 
                 dbc.Row([
@@ -1136,6 +1168,61 @@ if POD_MODE and SEED_MODE:
 # PER-CAMERA CALLBACKS
 # ═════════════════════════════════════════════════════════════════════════════
 
+def lighting_widgets(label: str, s: dict):
+    """(header pill, panel strip, modal reading line, modal button label)
+    from a snapshot's `lighting` block. Older cameras → all empty."""
+    lt = s.get("lighting") if s.get("online") else None
+    if not lt or not lt.get("status") or lt.get("status") == "unknown":
+        return "", None, "", "Continue"
+    g = lt.get("median_gray")
+    gtxt = f"{g:.0f}" if isinstance(g, (int, float)) else "—"
+    st = lt["status"]
+    if st == "ok":
+        return (dbc.Badge(f"💡 light {gtxt}", color="success",
+                          className="fw-normal"),
+                None, "", "Continue")
+    low = st == "low"
+    pill = dbc.Badge(f"💡 {'LOW LIGHT' if low else 'TOO BRIGHT'} · {gtxt}",
+                     color="warning", text_color="dark",
+                     className="fw-bold")
+    strip = dbc.Alert([
+        html.B(f"⚠ {'Low light' if low else 'Too much light'} on the "
+               f"{label.lower()} camera (reading {gtxt}, expected 60–90). "),
+        ("Colour will be blacked out and sizes inflated until the lights "
+         "are fixed — counting still works. Are the lights on?") if low else
+        ("Highlights are clipping — colour will be unreliable. Dim or "
+         "move the light."),
+    ], color="warning", className="small py-2 mb-2")
+    if low:
+        reading = html.Span(f"Current reading: {gtxt} (expected 60–90) — "
+                            f"still low.", className="text-danger")
+        btn = "Continue anyway"
+    else:
+        reading = html.Span(f"Current reading: {gtxt} — lights look OK now.",
+                            className="text-success")
+        btn = "Continue"
+    return pill, strip, reading, btn
+
+
+def idle_widget(ctl, s: dict, busy: bool):
+    """Red banner when the camera (0.7.0+) sees material flowing while no
+    run is active: >= 12 confident frames in its 3 s window, last within
+    1.5 s. Same rule as the kit station."""
+    ia = s.get("idle_activity") if s.get("online") else None
+    flowing = (not busy and ia and ia.get("frames", 0) >= 12
+               and ia.get("last_s_ago") is not None
+               and ia["last_s_ago"] <= 1.5)
+    if not flowing:
+        return None
+    need = "Sample Name" if ctl.weight_after_stop else "Sample Name and weight"
+    return dbc.Alert([
+        html.Div(f"⚠ {ctl.label}s are moving but no run is started",
+                 className="fw-bold", style={"fontSize": "17px"}),
+        html.Div(f"Scan the tag / enter the {need} and press Start — "
+                 f"nothing is being counted right now.", className="small"),
+    ], color="danger", className="py-2 mb-2")
+
+
 def register_panel_callbacks(mode: str) -> None:
     ctl = CONTROLLERS[mode]
 
@@ -1156,6 +1243,11 @@ def register_panel_callbacks(mode: str) -> None:
         Output(f"saveframes-{mode}", "disabled"),
         Output(f"admin-status-{mode}", "children"),
         Output(f"log-{mode}", "children"),
+        Output(f"lightpill-{mode}", "children"),
+        Output(f"lightwarn-{mode}", "children"),
+        Output(f"idlewarn-{mode}", "children"),
+        Output(f"ll-reading-{mode}", "children"),
+        Output(f"ll-continue-{mode}", "children"),
         Input("poll", "n_intervals"),
     )
     def poll_panel(_n, _mode=mode):
@@ -1192,6 +1284,9 @@ def register_panel_callbacks(mode: str) -> None:
         sess = SESSIONS[_mode].snapshot()
         sess_name = sess["name"] or "(unnamed — set a name at the top)"
         current = f"Session: {sess_name} · {len(sess['session'])} run(s)"
+        pill, lightwarn, ll_reading, ll_btn = lighting_widgets(
+            CONTROLLERS[_mode].label, s)
+        idlewarn = idle_widget(CONTROLLERS[_mode], s, busy)
         return (
             str(s["count"]), s["elapsed"], f"{s['fps']:.1f} fps",
             f"Active: {s['active']}", light,
@@ -1200,12 +1295,16 @@ def register_panel_callbacks(mode: str) -> None:
             (not running) or stopping,        # stop disabled
             busy, busy, busy, busy,           # inputs locked during a run
             admin_lines, s["log"],
+            pill, lightwarn, idlewarn, ll_reading, ll_btn,
         )
 
     # ── Start ─────────────────────────────────────────────────────────────────
     @app.callback(
         Output(f"alert-{mode}", "children"),
+        Output(f"ll-modal-{mode}", "is_open"),
         Input(f"start-{mode}", "n_clicks"),
+        Input(f"ll-continue-{mode}", "n_clicks"),
+        Input(f"ll-cancel-{mode}", "n_clicks"),
         State(f"name-{mode}", "value"),
         State(f"plot-{mode}", "value"),
         State(f"weight-{mode}", "value"),
@@ -1213,7 +1312,21 @@ def register_panel_callbacks(mode: str) -> None:
         State("ui-mode", "value"),
         prevent_initial_call=True,
     )
-    def on_start(_n, name, plot, weight, save_frames, ui_mode, _mode=mode):
+    def on_start(_n, _cont, _cancel, name, plot, weight, save_frames,
+                 ui_mode, _mode=mode):
+        trig = dash.ctx.triggered_id
+        if trig == f"ll-cancel-{_mode}":
+            return dash.no_update, False
+        if trig == f"start-{_mode}":
+            # Low light (camera 0.7.2+): warn before starting — re-asked on
+            # EVERY start by design; Continue in the modal goes ahead.
+            lt = CONTROLLERS[_mode].snapshot().get("lighting") or {}
+            if lt.get("status") == "low":
+                return dash.no_update, True
+        alert = _do_start(_mode, name, plot, weight, save_frames, ui_mode)
+        return alert, False
+
+    def _do_start(_mode, name, plot, weight, save_frames, ui_mode):
         ctlr = CONTROLLERS[_mode]
         name = str(name or "").strip()
         plot = str(plot or "").strip()
