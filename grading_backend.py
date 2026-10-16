@@ -34,6 +34,32 @@ import oakctl_tools
 from camera_client import CameraClient, CameraClientError, DEFAULT_PORT
 
 
+def apply_light_thresholds(lighting, thresholds):
+    """Re-judge the camera's lighting block with the STATION's thresholds
+    (config.yaml `lighting:` block, global or per camera). The camera
+    bakes fleet-wide numbers into its package; chute paint and fixtures
+    differ by site, so a site can say what "low" means for it without a
+    camera rebuild. Returns the block with status/warn_* replaced and
+    `source: "station"`; unchanged (source "camera") when no thresholds
+    are configured; None stays None."""
+    if not isinstance(lighting, dict):
+        return lighting
+    out = dict(lighting)
+    out.setdefault("source", "camera")
+    if not thresholds:
+        return out
+    try:
+        low = float(thresholds.get("warn_below_gray", out.get("warn_below_gray", 45)))
+        high = float(thresholds.get("warn_above_gray", out.get("warn_above_gray", 160)))
+    except (TypeError, ValueError):
+        return out
+    g = out.get("median_gray")
+    out["warn_below_gray"], out["warn_above_gray"], out["source"] = low, high, "station"
+    if isinstance(g, (int, float)) and out.get("status") not in (None, "unknown"):
+        out["status"] = "low" if g < low else "high" if g > high else "ok"
+    return out
+
+
 def lighting_summary(lighting) -> str:
     """'ok (68)' / 'low (34)' style one-liner from a camera's /status
     lighting block (pod-counter 0.7.2+); '' when it isn't reported."""
@@ -283,6 +309,9 @@ class CameraController:
         self._run_plot_weight = ""
         self._run_meta: dict = {}
         self._run_light = ""          # lighting reading at run start
+        # Station-side lighting thresholds from config.yaml (None = use
+        # the camera's own verdict). See apply_light_thresholds().
+        self.light_thresholds = None
 
         self._auto_start_tried = False
         self._poll_thread: Optional[threading.Thread] = None
@@ -457,7 +486,8 @@ class CameraController:
             self._run_plot_name = plot_name
             self._run_plot_weight = plot_weight
             self._run_meta = dict(meta or {})
-            self._run_light = lighting_summary(s.get("lighting"))
+            self._run_light = lighting_summary(
+                apply_light_thresholds(s.get("lighting"), self.light_thresholds))
         self._log(f"Run started: {self._attached_run}  |  Plot: {plot or '—'} "
                   f" |  Weight: {plot_weight + 'g' if plot_weight else '—'}  |  "
                   f"frames {'ON (saved on camera)' if save_frames else 'off'}")
@@ -791,7 +821,7 @@ class CameraController:
             # 0.7.0+: confident detections while idle (material flowing with
             # no run); 0.7.2+: lighting monitor {status, median_gray, ...}.
             "idle_activity": s.get("idle_activity"),
-            "lighting": s.get("lighting"),
+            "lighting": apply_light_thresholds(s.get("lighting"), self.light_thresholds),
             # 0.7.4+: station-supplied clock {synced, now, ...}
             "clock": s.get("clock"),
             "save_frames": bool(s.get("save_frames", False)),
@@ -819,4 +849,9 @@ def build_controllers(cfg: dict) -> dict[str, CameraController]:
             session=SessionLog(output_dir, mode),
             weight_after_stop=bool(mc.get("weight_after_stop", False)),
         )
+        # lighting thresholds: global `lighting:` block, overridden per
+        # camera by `modes.<mode>.lighting:` — both optional.
+        thr = dict(cfg.get("lighting") or {})
+        thr.update(mc.get("lighting") or {})
+        out[mode].light_thresholds = thr or None
     return out

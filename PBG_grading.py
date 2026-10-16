@@ -1187,15 +1187,18 @@ def lighting_widgets(label: str, s: dict):
                      className="fw-bold")
     strip = dbc.Alert([
         html.B(f"⚠ {'Low light' if low else 'Too much light'} on the "
-               f"{label.lower()} camera (reading {gtxt}, expected 60–90). "),
+               f"{label.lower()} camera (reading {gtxt}, warns "
+               f"{'below' if low else 'above'} "
+               f"{lt.get('warn_below_gray' if low else 'warn_above_gray', '?'):.0f}). "),
         ("Colour will be blacked out and sizes inflated until the lights "
          "are fixed — counting still works. Are the lights on?") if low else
         ("Highlights are clipping — colour will be unreliable. Dim or "
          "move the light."),
     ], color="warning", className="small py-2 mb-2")
     if low:
-        reading = html.Span(f"Current reading: {gtxt} (expected 60–90) — "
-                            f"still low.", className="text-danger")
+        reading = html.Span(f"Current reading: {gtxt} (warns below "
+                            f"{lt.get('warn_below_gray', 45):.0f}) — still low.",
+                            className="text-danger")
         btn = "Continue anyway"
     else:
         reading = html.Span(f"Current reading: {gtxt} — lights look OK now.",
